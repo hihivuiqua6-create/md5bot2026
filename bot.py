@@ -330,6 +330,9 @@ def welcome(chat_id):
 
 @bot.message_handler(commands=["start", "menu", "help"])
 def start(message):
+    # /start luôn là nút thoát: hủy bước nhập hash/key/giftcode/đơn đang chờ.
+    try: bot.clear_step_handler_by_chat_id(message.chat.id)
+    except Exception: pass
     register_user(message); welcome(message.chat.id)
 
 
@@ -390,6 +393,10 @@ def ask_deposit(cid, call=None):
 
 
 def create_deposit(message):
+    if (message.text or "").strip().lower() in ("/start", "/menu"):
+        try: bot.clear_step_handler_by_chat_id(message.chat.id)
+        except Exception: pass
+        register_user(message); welcome(message.chat.id); return
     register_user(message); uid = message.chat.id
     try: amount = int(re.sub(r"[^0-9]", "", message.text or ""))
     except ValueError: amount = 0
@@ -480,6 +487,10 @@ def play(cid, call=None):
 
 
 def analyze_message(message):
+    if (message.text or "").strip().lower() in ("/start", "/menu"):
+        try: bot.clear_step_handler_by_chat_id(message.chat.id)
+        except Exception: pass
+        register_user(message); welcome(message.chat.id); return
     if not user_key(message.chat.id):
         bot.send_message(message.chat.id, "🔒 Key đã hết hạn hoặc chưa được kích hoạt.")
         return
@@ -522,6 +533,10 @@ def enter_key_legacy(call):
 
 
 def activate_key(message):
+    if (message.text or "").strip().lower() in ("/start", "/menu"):
+        try: bot.clear_step_handler_by_chat_id(message.chat.id)
+        except Exception: pass
+        register_user(message); welcome(message.chat.id); return
     key = (message.text or "").strip().upper()
     with db() as c:
         row = c.execute("SELECT * FROM keys WHERE key=?", (key,)).fetchone()
@@ -531,6 +546,10 @@ def activate_key(message):
     bot.send_message(message.chat.id, f"✅ <b>Kích hoạt key thành công!</b>\n\n💎 Gói: <b>{html.escape(row['package_name'])}</b>\n⏳ Hạn đến: <code>{exp}</code>")
 
 def redeem_giftcode(message):
+    if (message.text or "").strip().lower() in ("/start", "/menu"):
+        try: bot.clear_step_handler_by_chat_id(message.chat.id)
+        except Exception: pass
+        register_user(message); welcome(message.chat.id); return
     register_user(message)
     uid = message.chat.id; code = (message.text or "").strip().upper()
     if not code:
