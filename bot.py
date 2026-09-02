@@ -39,13 +39,6 @@ DEFAULT_PACKAGES = {
     "Gói 30 ngày": {"price": 150000, "days": 30},
 }
 
-# Vietnam Bank Codes Map for VietQR
-BANK_CODE_MAP = {
-    "MBBank": "970422", "MSBBank": "970426", "TCBank": "970407", "VPBank": "970432",
-    "ACBank": "970425", "SHB": "970443", "EIB": "970431", "GPBANK": "970408",
-    "TPBank": "970423", "VAB": "971005", "Techcombank": "970407", "AgriBank": "970405"
-}
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("md5tx")
 
@@ -137,6 +130,7 @@ def set_setting(key, value):
     with db() as c:
         c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value, ensure_ascii=False)))
 
+
 def is_admin(uid):
     return uid in ADMIN_IDS and uid != 0
 
@@ -170,8 +164,31 @@ def register_user(message):
                   (u.id, u.username or "", u.first_name or "", t, t))
 
 
+# Sau khi có 5 đơn chưa được duyệt, user phải chờ 5 phút kể từ đơn gần nhất
+# trước khi được tạo thêm đơn nạp mới.
+MAX_PENDING_DEPOSITS = 5
+DEPOSIT_COOLDOWN_MINUTES = 5
+
+
 def fmt_money(n):
     return f"{int(n):,}".replace(",", ".") + "đ"
+
+
+def vietqr_bank_identifier(bank_code):
+    """Đổi tên ngân hàng thường dùng sang mã VietQR ổn định.
+
+    VietQR ưu tiên BIN hoặc mã viết tắt. Vì vậy các giá trị như MSBBank,
+    MSB Bank và MBBank không được đưa nguyên văn vào đường dẫn ảnh QR.
+    """
+    raw = str(bank_code or "").strip()
+    normalized = re.sub(r"[^A-Z0-9]", "", raw.upper())
+    aliases = {
+        "MSB": "970426",
+        "MSBBANK": "970426",
+        "MBBANK": "970422",
+        "MB": "970422",
+    }
+    return aliases.get(normalized, raw)
 
 
 def user_key(uid):
@@ -288,7 +305,6 @@ class HashAnalyzer:
 
         byte_counts = Counter(data)
         entropy = 0.0
-        n = len(data)
         for count in byte_counts.values():
             p = count / n
             if p > 0:
@@ -541,33 +557,36 @@ def create_deposit(message):
     try: amount = int(re.sub(r"[^0-9]", "", message.text or ""))
     except ValueError: amount = 0
     if amount <= 0: bot.send_message(uid, "❌ Số tiền không hợp lệ."); return
-    
     with db() as c:
         pending = c.execute("SELECT COUNT(*) n FROM deposits WHERE telegram_id=? AND status='pending'", (uid,)).fetchone()["n"]
         last = c.execute("SELECT created_at FROM deposits WHERE telegram_id=? ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
-    
-    # Fixed: Allow 5 pending deposits instead of 3
-    if pending >= 5:
-        bot.send_message(uid, "⚠️ Bạn đang có tối đa 5 đơn chờ. Vui lòng chờ xử lý."); return
-    
-    # Check 5 minute cooldown for new orders (only if no pending orders exist)
-    if pending == 0 and last:
+    # Cho phép tối đa 5 đơn chờ bình thường. Khi đã có từ 5 đơn chưa
+    # được duyệt, chỉ cho tạo đơn tiếp theo sau 5 phút kể từ đơn gần nhất.
+    # Sau khi admin duyệt hoặc từ chối một đơn, bộ đếm pending tự giảm.
+    if pending >= MAX_PENDING_DEPOSITS and last:
         try:
-            if now() - datetime.fromisoformat(last["created_at"]) < timedelta(minutes=5):
-                bot.send_message(uid, "⏳ Vui lòng chờ 5 phút giữa các lần tạo đơn nạp."); return
-        except ValueError: pass
-    
+            elapsed = now() - datetime.fromisoformat(last["created_at"])
+            cooldown = timedelta(minutes=DEPOSIT_COOLDOWN_MINUTES)
+            if elapsed < cooldown:
+                remaining = max(1, int((cooldown - elapsed).total_seconds() // 60) + 1)
+                bot.send_message(uid, f"⏳ Bạn đang có {pending} đơn chưa được duyệt. Vui lòng chờ khoảng {remaining} phút rồi tạo đơn tiếp theo.")
+                return
+        except (TypeError, ValueError):
+            log.warning("Không đọc được thời gian đơn nạp gần nhất của user %s", uid)
     bank = get_setting("bank", DEFAULT_BANK)
-    content = f"{bank['note_prefix']}{uid}"
+    content = f"{bank.get('note_prefix', 'NAPTX')}{uid}"
     with db() as c:
         cur = c.execute("INSERT INTO deposits(telegram_id,amount,content,status,created_at) VALUES(?,?,?,?,?)", (uid, amount, content, "pending", iso(now())))
         did = cur.lastrowid
-    
-    # Fixed: Support Vietnamese bank codes for VietQR
-    bank_code = bank['bank_code']
-    vietqr_code = BANK_CODE_MAP.get(bank_code, bank_code)
-    
-    qr = f"https://img.vietqr.io/image/{vietqr_code}-{bank['account_no']}-compact2.png?amount={amount}&addInfo={content}&accountName={requests.utils.quote(bank['account_name'])}"
+    bank_identifier = vietqr_bank_identifier(bank.get("bank_code", DEFAULT_BANK["bank_code"]))
+    account_no = str(bank.get("account_no", "")).strip()
+    account_name = str(bank.get("account_name", "")).strip()
+    qr_params = (
+        f"amount={amount}"
+        f"&addInfo={requests.utils.quote(content, safe='')}"
+        f"&accountName={requests.utils.quote(account_name, safe='')}"
+    )
+    qr = f"https://img.vietqr.io/image/{requests.utils.quote(bank_identifier, safe='')}-{requests.utils.quote(account_no, safe='')}-compact2.png?{qr_params}"
     caption = f"💳 <b>ĐƠN NẠP #{did}</b>\n\n🏦 Ngân hàng: <code>{html.escape(bank['bank_code'])}</code>\n🔢 STK: <code>{html.escape(bank['account_no'])}</code>\n👤 Tên: <code>{html.escape(bank['account_name'])}</code>\n💰 Số tiền: <b>{fmt_money(amount)}</b>\n📝 Nội dung: <code>{content}</code>\n\nSau khi chuyển khoản, hãy bấm nút bên dưới."
     k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("✅ Tôi đã nạp tiền", callback_data=f"confirm_deposit:{did}"), types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
     bot.send_photo(uid, qr, caption=caption, reply_markup=k)
@@ -656,8 +675,7 @@ def analyze_message(message):
     nums = [int(digest[i:i+2], 16) % 6 + 1 for i in (0, 2, 4)]
     total = sum(nums)
     verdict = "🅣 TÀI" if out['result'] == "Tài" else "🅧 XỈU"
-    # Added Telegram Premium icons: ⭐ for premium features
-    text = (f"🔮 <b>PHÂN TÍCH MD5 TÀI/XỈU</b> ⭐\n\n"
+    text = (f"🔮 <b>PHÂN TÍCH MD5 TÀI/XỈU</b>\n\n"
             f"📦 Phiên bản: <b>Mới Nhất</b>\n"
             f"📝 MD5 hiện tại: <code>{short}</code>\n\n"
             f"🎲 Bộ số mô phỏng: <b>{nums[0]}-{nums[1]}-{nums[2]}</b> | Tổng: <b>{total}</b>\n"
@@ -668,369 +686,203 @@ def analyze_message(message):
     bot.register_next_step_handler_by_chat_id(message.chat.id, analyze_message)
 
 
+def show_account(cid, call=None):
+    row = user_key(cid)
+    if row: text = f"👤 <b>TÀI KHOẢN</b>\n\n🔑 Gói: <b>{html.escape(row['package_name'])}</b>\n⏳ Hết hạn: <code>{row['expires_at']}</code>"
+    else: text = "👤 <b>TÀI KHOẢN</b>\n\nBạn chưa có key còn hạn."
+    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("💎 Mua gói", callback_data="packages"), types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
+    if call: edit_page(call, text, k)
+    else: bot.send_message(cid, text, reply_markup=k)
+
+@bot.message_handler(commands=["nhapkey"])
+def enter_key_cmd(message):
+    bot.send_message(message.chat.id, "🔐 Gửi key cần kích hoạt."); bot.register_next_step_handler_by_chat_id(message.chat.id, activate_key)
+
+@bot.callback_query_handler(func=lambda call: call.data == "enter_key_legacy")
+def enter_key_legacy(call):
+    bot.send_message(call.message.chat.id, "🔐 Gửi key cần kích hoạt."); bot.register_next_step_handler_by_chat_id(call.message.chat.id, activate_key)
+
+
 def activate_key(message):
     if (message.text or "").strip().lower() in ("/start", "/menu"):
         try: bot.clear_step_handler_by_chat_id(message.chat.id)
         except Exception: pass
         register_user(message); welcome(message.chat.id); return
-    register_user(message); uid = message.chat.id; key = (message.text or "").strip().upper()
-    if not re.match(r"^TX-[A-Z0-9]{20}$", key):
-        bot.send_message(uid, "❌ Định dạng key không hợp lệ. Key phải có dạng TX-XXXX...XXXX (20 ký tự hex).")
-        return
+    key = (message.text or "").strip().upper()
     with db() as c:
-        c.execute("BEGIN IMMEDIATE")
         row = c.execute("SELECT * FROM keys WHERE key=?", (key,)).fetchone()
-        if not row:
-            bot.send_message(uid, "❌ Key này không tồn tại hoặc đã xoá.")
-        elif row["locked"]:
-            bot.send_message(uid, "🔒 Key này đã bị khoá.")
-        elif row["used_by"] and row["used_by"] != uid:
-            bot.send_message(uid, "❌ Key này đã được sử dụng bởi người khác.")
-        elif row["used_by"] == uid:
-            bot.send_message(uid, "✅ Key này đã được kích hoạt trước đó cho tài khoản của bạn.")
-        else:
-            created = iso(now()); exp = iso(now() + timedelta(days=row["days"]))
-            c.execute("UPDATE keys SET used_by=?, used_at=?, expires_at=? WHERE key=?", (uid, created, exp, key))
-            bot.send_message(uid, f"✅ <b>KÍCH HOẠT KEY THÀNH CÔNG</b>\n\n🔑 Key: <code>{key}</code>\n📦 Gói: <b>{html.escape(row['package_name'])}</b>\n⏳ Hạn dùng: <code>{exp}</code>")
-
-
-def confirm_deposit(uid, did, call):
-    with db() as c:
-        dep = c.execute("SELECT * FROM deposits WHERE id=? AND telegram_id=?", (did, uid)).fetchone()
-    if not dep:
-        bot.answer_callback_query(call.id, "❌ Không tìm thấy đơn nạp.", show_alert=True)
-        return
-    if dep["status"] != "pending":
-        bot.answer_callback_query(call.id, f"⚠️ Đơn đã {dep['status']}.", show_alert=True)
-        return
-    text = f"💳 <b>ĐÃ CHUYỂN KHOẢN?</b>\n\n✅ Xác nhận bạn đã chuyển khoản {fmt_money(dep['amount'])} cho đơn #{did}.\n\n📝 Nội dung chuyển: <code>{dep['content']}</code>\n\n⏳ Admin sẽ xử lý trong vòng 5 phút."
-    k = types.InlineKeyboardMarkup(row_width=2)
-    k.add(types.InlineKeyboardButton("✅ Đã gửi", callback_data="home"), types.InlineKeyboardButton("❌ Quay lại", callback_data="home"))
-    edit_page(call, text, k)
-
-
-def show_account(cid, call=None):
-    with db() as c:
-        u = c.execute("SELECT * FROM users WHERE telegram_id=?", (cid,)).fetchone()
-    balance = fmt_money(u["balance"] if u and "balance" in u.keys() else 0)
-    active = user_key(cid)
-    text = f"👤 <b>TÀI KHOẢN CỦA BẠN</b>\n\n🆔 Telegram ID: <code>{cid}</code>\n💰 Số dư: <b>{balance}</b>\n📦 Gói hiện tại: <b>{html.escape(active['package_name']) if active else 'Không có'}</b>"
-    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("💳 Nạp tiền", callback_data="deposit"), types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
-    if call: edit_page(call, text, k)
-    else: bot.send_message(cid, text, reply_markup=k)
-
+        if not row or row["used_by"] is not None or row["locked"]:
+            bot.send_message(message.chat.id, "❌ Key không đúng, đã được sử dụng hoặc đang bị khóa."); return
+        exp = iso(now() + timedelta(days=int(row["days"])))
+        c.execute("UPDATE keys SET used_by=?,used_at=?,expires_at=? WHERE key=?", (message.chat.id, iso(now()), exp, key))
+    bot.send_message(message.chat.id, f"✅ <b>Kích hoạt key thành công!</b>\n\n💎 Gói: <b>{html.escape(row['package_name'])}</b>\n⏳ Hạn đến: <code>{exp}</code>")
 
 def redeem_giftcode(message):
     if (message.text or "").strip().lower() in ("/start", "/menu"):
         try: bot.clear_step_handler_by_chat_id(message.chat.id)
         except Exception: pass
         register_user(message); welcome(message.chat.id); return
-    register_user(message); uid = message.chat.id; code = (message.text or "").strip().upper()
+    register_user(message)
+    uid = message.chat.id; code = (message.text or "").strip().upper()
+    if not code:
+        bot.send_message(uid, "❌ Mã giftcode không hợp lệ."); return
     with db() as c:
-        gc = c.execute("SELECT * FROM giftcodes WHERE code=?", (code,)).fetchone()
-        if not gc:
-            bot.send_message(uid, "❌ Mã giftcode không hợp lệ hoặc đã xoá."); return
-        if gc["used_count"] >= gc["max_uses"]:
-            bot.send_message(uid, "❌ Mã này đã dùng hết."); return
+        row = c.execute("SELECT * FROM giftcodes WHERE code=?", (code,)).fetchone()
         used = c.execute("SELECT 1 FROM giftcode_uses WHERE code=? AND telegram_id=?", (code, uid)).fetchone()
-        if used:
-            bot.send_message(uid, "❌ Bạn đã dùng mã này rồi."); return
-        c.execute("BEGIN IMMEDIATE")
-        c.execute("INSERT INTO giftcode_uses(code,telegram_id,used_at) VALUES(?,?,?)", (code, uid, iso(now())))
-        c.execute("UPDATE giftcodes SET used_count=used_count+1 WHERE code=?", (code,))
-        c.execute("UPDATE users SET balance=COALESCE(balance,0)+? WHERE telegram_id=?", (gc["amount"], uid))
-        text = f"✅ <b>SỬ DỤNG GIFTCODE THÀNH CÔNG</b>\n\n💝 Nhận được: <b>{fmt_money(gc['amount'])}</b>\n💰 Số dư mới: <b>{fmt_money((c.execute('SELECT COALESCE(balance,0) b FROM users WHERE telegram_id=?', (uid,)).fetchone() or {}).get('b', 0) + gc['amount'])}</b>"
-    bot.send_message(uid, text)
+        if not row or row["used_count"] >= row["max_uses"] or used:
+            bot.send_message(uid, "❌ Giftcode không tồn tại, đã hết lượt hoặc bạn đã dùng mã này."); return
+        c.execute("INSERT OR IGNORE INTO giftcode_uses(code,telegram_id,used_at) VALUES(?,?,?)", (code, uid, iso(now())))
+        c.execute("UPDATE giftcodes SET used_count=used_count+1 WHERE code=? AND used_count<max_uses", (code,))
+        c.execute("UPDATE users SET balance=COALESCE(balance,0)+? WHERE telegram_id=?", (row["amount"], uid))
+        balance = c.execute("SELECT balance FROM users WHERE telegram_id=?", (uid,)).fetchone()["balance"]
+    bot.send_message(uid, f"🎉 <b>ĐỔI GIFTCODE THÀNH CÔNG</b>\n\n💰 Nhận được: <b>{fmt_money(row['amount'])}</b>\n💳 Số dư hiện tại: <b>{fmt_money(balance)}</b>")
 
 
+# ============================================================
+# ADMIN TELEGRAM
+# ============================================================
 def admin_menu(cid, call=None):
-    text = "🛠 <b>MENU QUẢN TRỊ</b>\n\nChọn chức năng bạn muốn quản lý:"
     k = types.InlineKeyboardMarkup(row_width=2)
-    k.add(types.InlineKeyboardButton("📊 Thống kê", callback_data="admin_stats"), types.InlineKeyboardButton("🔑 Tạo key", callback_data="admin_key"))
-    k.add(types.InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"), types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
-    if call: edit_page(call, text, k)
-    else: bot.send_message(cid, text, reply_markup=k)
+    k.add(types.InlineKeyboardButton("🔑 Tạo key", callback_data="admin_key"), types.InlineKeyboardButton("📊 Thống kê", callback_data="admin_stats"))
+    k.add(types.InlineKeyboardButton("📢 Thông báo toàn bộ", callback_data="admin_broadcast"))
+    k.add(types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
+    if call: edit_page(call, "🛠 <b>BẢNG QUẢN TRỊ</b>\n\nChọn chức năng quản lý bên dưới.", k)
+    else: bot.send_message(cid, "🛠 <b>BẢNG QUẢN TRỊ</b>", reply_markup=k)
+
+@bot.message_handler(commands=["admin"])
+def admin_cmd(message):
+    if is_admin(message.from_user.id): admin_menu(message.chat.id)
+
+@bot.message_handler(commands=["taokey"])
+def create_key_cmd(message):
+    if not is_admin(message.from_user.id): return
+    name = " ".join((message.text or "").split()[1:]).replace("_", " ").strip()
+    packages = get_setting("packages", DEFAULT_PACKAGES)
+    if name not in packages:
+        bot.send_message(message.chat.id, "Tên gói không đúng. Gói hiện có: " + ", ".join(packages)); return
+    p = packages[name]
+    with db() as c:
+        count = c.execute("SELECT COUNT(*) n FROM keys").fetchone()["n"] + 1
+    seed = f"{BOT_TOKEN}:{message.from_user.id}:{name}:{count}:{time.time_ns()}".encode()
+    key = "TX-" + hashlib.sha256(seed).hexdigest()[:20].upper()
+    with db() as c: c.execute("INSERT INTO keys(key,package_name,days,created_at) VALUES(?,?,?,?)", (key, name, p["days"], iso(now())))
+    bot.send_message(message.chat.id, f"Đã tạo key cho <b>{html.escape(name)}</b>:\n<code>{key}</code>")
+
+@bot.message_handler(commands=["taogift"])
+def create_gift_cmd(message):
+    if not is_admin(message.from_user.id): return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Dùng /taogift TENGIFT [soluot]. Mỗi mã nhận ngẫu nhiên từ 1.000đ đến 10.000đ."); return
+    code = parts[1].upper()
+    try: max_uses = max(1, int(parts[2])) if len(parts) > 2 else 1
+    except ValueError: max_uses = 1
+    # Chỉ giftcode dùng ngẫu nhiên; bộ phân tích hash vẫn deterministic.
+    import secrets
+    amount = secrets.randbelow(9001) + 1000
+    with db() as c: c.execute("INSERT OR REPLACE INTO giftcodes(code,amount,max_uses,used_count,created_at) VALUES(?,?,?,?,?)", (code, amount, max_uses, 0, iso(now())))
+    bot.send_message(message.chat.id, f"🎁 Đã tạo giftcode <code>{code}</code>\n💰 Giá trị: <b>{fmt_money(amount)}</b>\n👥 Số lượt: <b>{max_uses}</b>")
+
+
+def broadcast_text(admin_chat_id, text):
+    with db() as c: users = [r["telegram_id"] for r in c.execute("SELECT telegram_id FROM users")]
+    sent = 0
+    for target in users:
+        try: bot.send_message(target, "📢 <b>Thông báo từ admin</b>\n\n" + html.escape(text)); sent += 1
+        except Exception: pass
+    with db() as c: c.execute("INSERT INTO broadcasts(text,sent_at) VALUES(?,?)", (text, iso(now())))
+    bot.send_message(admin_chat_id, f"✅ Đã gửi thông báo tới {sent}/{len(users)} người dùng.")
+
+
+def broadcast_next_step(message):
+    if is_admin(message.from_user.id) and (message.text or "").strip():
+        broadcast_text(message.chat.id, message.text.strip())
+
+
+@bot.message_handler(commands=["thongbao"])
+def broadcast_cmd(message):
+    if not is_admin(message.from_user.id): return
+    text = (message.text or "").partition(" ")[2].strip()
+    if text: broadcast_text(message.chat.id, text)
+    else:
+        bot.send_message(message.chat.id, "📢 Hãy nhập nội dung thông báo ở tin nhắn kế tiếp.")
+        bot.register_next_step_handler_by_chat_id(message.chat.id, broadcast_next_step)
 
 
 def send_stats(cid, call=None):
     with db() as c:
-        stats = {
-            "users": c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],
-            "keys": c.execute("SELECT COUNT(*) n FROM keys").fetchone()["n"],
-            "pending": c.execute("SELECT COUNT(*) n FROM deposits WHERE status='pending'").fetchone()["n"],
-            "approved": c.execute("SELECT COUNT(*) n FROM deposits WHERE status='approved'").fetchone()["n"],
-            "revenue": c.execute("SELECT COALESCE(SUM(amount),0) s FROM deposits WHERE status='approved'").fetchone()["s"],
-        }
-    text = f"📊 <b>THỐNG KÊ HỆ THỐNG</b>\n\n👥 Tổng user: <b>{stats['users']}</b>\n🔑 Tổng key: <b>{stats['keys']}</b>\n⏳ Đơn chờ: <b>{stats['pending']}</b>\n✅ Đơn duyệt: <b>{stats['approved']}</b>\n💰 Tổng doanh thu: <b>{fmt_money(stats['revenue'])}</b>"
-    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu"))
-    if call: edit_page(call, text, k)
-    else: bot.send_message(cid, text, reply_markup=k)
+        u = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+        k = c.execute("SELECT COUNT(*) n FROM keys WHERE used_by IS NULL").fetchone()["n"]
+        d = c.execute("SELECT COUNT(*) n FROM deposits WHERE status='pending'").fetchone()["n"]
+        total = c.execute("SELECT COALESCE(SUM(amount),0) s FROM deposits WHERE status='approved'").fetchone()["s"]
+    text = f"📊 <b>THỐNG KÊ HỆ THỐNG</b>\n\n👥 Người dùng: <b>{u}</b>\n🔑 Key chưa dùng: <b>{k}</b>\n⏳ Đơn chờ duyệt: <b>{d}</b>\n💰 Tổng đã duyệt: <b>{fmt_money(total)}</b>"
+    kbd = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Quản trị", callback_data="admin_menu"))
+    if call: edit_page(call, text, kbd)
+    else: bot.send_message(cid, text, reply_markup=kbd)
 
 
-def broadcast_next_step(message):
-    if (message.text or "").strip().lower() in ("/start", "/menu"):
-        try: bot.clear_step_handler_by_chat_id(message.chat.id)
-        except Exception: pass
-        register_user(message); welcome(message.chat.id); return
-    register_user(message)
-    text = message.text or ""
+def notify_admin_deposit(did):
     with db() as c:
-        users = c.execute("SELECT telegram_id FROM users").fetchall()
-        c.execute("INSERT INTO broadcasts(text,sent_at) VALUES(?,?)", (text, iso(now())))
-    count = 0
-    for u in users:
-        try:
-            bot.send_message(u["telegram_id"], f"📢 <b>THÔNG BÁO TỪ ADMIN</b>\n\n{text}")
-            count += 1
-        except Exception:
-            pass
-    bot.send_message(message.chat.id, f"✅ Đã gửi thông báo tới <b>{count}/{len(users)}</b> user.")
+        r = c.execute("SELECT * FROM deposits WHERE id=?", (did,)).fetchone()
+    if not r: return
+    k = types.InlineKeyboardMarkup(); k.add(types.InlineKeyboardButton("✅ Duyệt đơn", callback_data=f"approve:{did}"), types.InlineKeyboardButton("❌ Từ chối", callback_data=f"reject:{did}"))
+    text = f"🔔 <b>YÊU CẦU XÁC NHẬN ĐƠN NẠP #{did}</b>\n\n👤 User: <code>{r['telegram_id']}</code>\n💰 Số tiền: <b>{fmt_money(r['amount'])}</b>\n📝 Nội dung: <code>{r['content']}</code>\n\nVui lòng kiểm tra giao dịch thực tế trước khi duyệt."
+    for aid in ADMIN_IDS:
+        try: bot.send_message(aid, text, reply_markup=k)
+        except Exception: pass
 
 
-def request_approve(uid, did, call):
-    if not is_admin(uid):
-        bot.answer_callback_query(call.id, "Bạn không phải admin.", show_alert=True)
-        return
-    text = f"⚠️ <b>XÁC NHẬN DUYỆT?</b>\n\nBạn sắp duyệt đơn #{did}.\n\nHành động này không thể hoàn tác."
-    k = types.InlineKeyboardMarkup(row_width=2)
-    k.add(types.InlineKeyboardButton("✅ Duyệt", callback_data=f"approve_confirm:{did}"), types.InlineKeyboardButton("❌ Hủy", callback_data="home"))
-    edit_page(call, text, k)
+def request_approve(admin_uid, did, call=None):
+    if not is_admin(admin_uid): return
+    with db() as c: r = c.execute("SELECT * FROM deposits WHERE id=? AND status='pending'", (did,)).fetchone()
+    if not r: return
+    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("✅ XÁC NHẬN DUYỆT & CỘNG TIỀN", callback_data=f"approve_confirm:{did}"), types.InlineKeyboardButton("↩️ Hủy", callback_data="admin_menu"))
+    edit_page(call, f"⚠️ <b>XÁC NHẬN DUYỆT ĐƠN #{did}</b>\n\n💰 Số tiền: <b>{fmt_money(r['amount'])}</b>\n👤 User: <code>{r['telegram_id']}</code>\n\nSau khi xác nhận, hệ thống sẽ cộng tiền vào số dư user. Hãy chắc chắn đã kiểm tra giao dịch.", k)
 
 
-def request_reject(uid, did, call):
-    if not is_admin(uid):
-        bot.answer_callback_query(call.id, "Bạn không phải admin.", show_alert=True)
-        return
-    text = f"⚠️ <b>XÁC NHẬN TỪ CHỐI?</b>\n\nBạn sắp từ chối đơn #{did}.\n\nHành động này không thể hoàn tác."
-    k = types.InlineKeyboardMarkup(row_width=2)
-    k.add(types.InlineKeyboardButton("❌ Từ chối", callback_data=f"reject_confirm:{did}"), types.InlineKeyboardButton("🏠 Hủy", callback_data="home"))
-    edit_page(call, text, k)
+def request_reject(admin_uid, did, call=None):
+    if not is_admin(admin_uid): return
+    with db() as c: r = c.execute("SELECT * FROM deposits WHERE id=? AND status='pending'", (did,)).fetchone()
+    if not r: return
+    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("❌ XÁC NHẬN TỪ CHỐI", callback_data=f"reject_confirm:{did}"), types.InlineKeyboardButton("↩️ Hủy", callback_data="admin_menu"))
+    edit_page(call, f"⚠️ <b>XÁC NHẬN TỪ CHỐI ĐƠN #{did}</b>\n\nUser: <code>{r['telegram_id']}</code>\nSố tiền: <b>{fmt_money(r['amount'])}</b>", k)
+
+
+def confirm_deposit(uid, did, call=None):
+    with db() as c: r = c.execute("SELECT * FROM deposits WHERE id=? AND telegram_id=?", (did, uid)).fetchone()
+    if not r or r["status"] != "pending":
+        bot.send_message(uid, "❌ Đơn không tồn tại hoặc đã xử lý."); return
+    bot.send_message(uid, f"✅ Đã gửi xác nhận đơn nạp <b>#{did}</b> tới admin. Vui lòng chờ duyệt.")
+    notify_admin_deposit(did)
 
 
 def decide_deposit(uid, did, approved):
-    if not is_admin(uid):
-        return
+    if not is_admin(uid): return
     with db() as c:
-        c.execute("BEGIN IMMEDIATE")
-        dep = c.execute("SELECT * FROM deposits WHERE id=?", (did,)).fetchone()
-        if not dep or dep["status"] != "pending":
-            return
+        r = c.execute("SELECT * FROM deposits WHERE id=?", (did,)).fetchone()
+        if not r or r["status"] != "pending": return
         status = "approved" if approved else "rejected"
-        c.execute("UPDATE deposits SET status=?, decided_at=?, decided_by=? WHERE id=?", (status, iso(now()), uid, did))
+        c.execute("UPDATE deposits SET status=?,decided_at=?,decided_by=? WHERE id=?", (status, iso(now()), uid, did))
         if approved:
-            c.execute("UPDATE users SET balance=COALESCE(balance,0)+? WHERE telegram_id=?", (dep["amount"], dep["telegram_id"]))
-            text = f"✅ <b>ĐƠN #{did} ĐÃ DUYỆT</b>\n\n💰 Cộng: <b>{fmt_money(dep['amount'])}</b>"
-        else:
-            text = f"❌ <b>ĐƠN #{did} ĐÃ TỪ CHỐI</b>\n\n📝 Vui lòng thử lại hoặc liên hệ admin."
-    try:
-        bot.send_message(dep["telegram_id"], text)
-    except Exception:
-        pass
+            c.execute("INSERT INTO users(telegram_id,username,first_name,balance,created_at,last_seen) VALUES(?,?,?,?,?,?) ON CONFLICT(telegram_id) DO NOTHING", (r["telegram_id"], "", "", 0, iso(now()), iso(now())))
+            c.execute("UPDATE users SET balance=COALESCE(balance,0)+? WHERE telegram_id=?", (int(r["amount"]), r["telegram_id"]))
+    if approved:
+        with db() as c: bal = c.execute("SELECT balance FROM users WHERE telegram_id=?", (r["telegram_id"],)).fetchone()["balance"]
+        bot.send_message(r["telegram_id"], f"✅ <b>NẠP TIỀN THÀNH CÔNG</b>\n\nĐơn <b>#{did}</b> đã được admin xác nhận.\n💰 Đã cộng: <b>{fmt_money(r['amount'])}</b>\n💳 Số dư hiện tại: <b>{fmt_money(bal)}</b>\n\nBạn có thể vào Mua gói để nhận key tự động.")
+        bot.send_message(uid, f"✅ Đã duyệt đơn <b>#{did}</b> và cộng <b>{fmt_money(r['amount'])}</b> vào tài khoản user.")
+    else:
+        bot.send_message(r["telegram_id"], f"❌ Đơn nạp #{did} đã bị từ chối. Vui lòng liên hệ admin để đối soát.")
+        bot.send_message(uid, f"❌ Đã xác nhận từ chối đơn <b>#{did}</b>.")
 
 
+# ============================================================
+# ADMIN WEB KHÔNG ĐĂNG NHẬP — CHỈ DÙNG MÔI TRƯỜNG RIÊNG
+# ============================================================
 ADMIN_HTML = """
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ bot_name }} - Admin</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: Arial, sans-serif; background: #f5f5f5; padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #333; margin-bottom: 20px; }
-        h2 { color: #555; margin-top: 30px; margin-bottom: 15px; border-bottom: 2px solid #007bff; padding-bottom: 10px; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }
-        .stat-box { background: #f9f9f9; padding: 15px; border-left: 4px solid #007bff; border-radius: 4px; }
-        .stat-box h3 { font-size: 14px; color: #666; margin-bottom: 5px; }
-        .stat-box .value { font-size: 24px; font-weight: bold; color: #007bff; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; color: #333; font-weight: bold; }
-        input[type="text"], input[type="number"], select, textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
-        textarea { resize: vertical; min-height: 100px; }
-        button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
-        button:hover { background: #0056b3; }
-        .table-wrapper { overflow-x: auto; margin-bottom: 30px; }
-        table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        th { background: #007bff; color: white; padding: 10px; text-align: left; }
-        td { padding: 10px; border-bottom: 1px solid #ddd; }
-        tr:nth-child(even) { background: #f9f9f9; }
-        .status-pending { color: #ff9800; font-weight: bold; }
-        .status-approved { color: #4caf50; font-weight: bold; }
-        .status-rejected { color: #f44336; font-weight: bold; }
-        .code { background: #f0f0f0; padding: 2px 5px; border-radius: 3px; font-family: monospace; font-size: 12px; }
-        .warning { background: #fff3cd; border: 1px solid #ffc107; padding: 10px; border-radius: 4px; margin-bottom: 15px; }
-        .error { background: #f8d7da; border: 1px solid #f5c6cb; padding: 10px; border-radius: 4px; margin-bottom: 15px; }
-        .success { background: #d4edda; border: 1px solid #c3e6cb; padding: 10px; border-radius: 4px; margin-bottom: 15px; }
-        .tabs { display: flex; gap: 10px; margin-bottom: 20px; border-bottom: 1px solid #ddd; }
-        .tab { padding: 10px 15px; cursor: pointer; border: none; background: none; color: #666; font-weight: bold; }
-        .tab.active { color: #007bff; border-bottom: 2px solid #007bff; }
-        .tab-content { display: none; }
-        .tab-content.active { display: block; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>⚙️ {{ bot_name }} - Quản Lý Admin</h1>
-        
-        {% if bot_ready %}
-            <div class="success">✅ Bot đang hoạt động</div>
-        {% else %}
-            <div class="warning">⚠️ Bot chưa được cấu hình. Hãy nhập BOT_TOKEN bên dưới.</div>
-        {% endif %}
-        
-        <div class="stats">
-            <div class="stat-box">
-                <h3>👥 Tổng User</h3>
-                <div class="value">{{ stats.users }}</div>
-            </div>
-            <div class="stat-box">
-                <h3>🔑 Key Chưa Dùng</h3>
-                <div class="value">{{ stats.unused_keys }}</div>
-            </div>
-            <div class="stat-box">
-                <h3>⏳ Đơn Chờ Xử Lý</h3>
-                <div class="value">{{ stats.pending }}</div>
-            </div>
-            <div class="stat-box">
-                <h3>💰 Tổng Doanh Thu</h3>
-                <div class="value">{{ stats.revenue }}</div>
-            </div>
-        </div>
-        
-        <h2>⚙️ Cài Đặt Runtime</h2>
-        <form method="POST" action="/admin/runtime">
-            <div class="form-group">
-                <label>🤖 BOT_TOKEN (từ BotFather)</label>
-                <input type="text" name="bot_token" placeholder="123456789:ABCDEF-GHIJK...">
-            </div>
-            <div class="form-group">
-                <label>👤 Admin IDs (cách nhau bằng dấu phẩy)</label>
-                <input type="text" name="admin_ids" value="{{ admin_ids }}" placeholder="123456789, 987654321">
-            </div>
-            <button type="submit">💾 Lưu Cấu Hình</button>
-        </form>
-        
-        <h2>🏦 Cấu Hình Ngân Hàng</h2>
-        <form method="POST" action="/admin/bank">
-            <div class="form-group">
-                <label>Mã Ngân Hàng (VD: MSBBank, MBBank, TCBank)</label>
-                <input type="text" name="bank_code" value="{{ bank.bank_code }}" placeholder="MSBBank">
-            </div>
-            <div class="form-group">
-                <label>Số Tài Khoản</label>
-                <input type="text" name="account_no" value="{{ bank.account_no }}" placeholder="0123456789">
-            </div>
-            <div class="form-group">
-                <label>Tên Chủ Tài Khoản</label>
-                <input type="text" name="account_name" value="{{ bank.account_name }}" placeholder="PHAM VAN A">
-            </div>
-            <div class="form-group">
-                <label>Tiền Tố Nội Dung Chuyển</label>
-                <input type="text" name="note_prefix" value="{{ bank.note_prefix }}" placeholder="NAPTX">
-            </div>
-            <div class="form-group">
-                <label>Link Liên Hệ Admin (Telegram)</label>
-                <input type="text" name="contact_link" value="{{ bank.contact_link }}" placeholder="https://t.me/username">
-            </div>
-            <button type="submit">💾 Lưu Ngân Hàng</button>
-        </form>
-        
-        <h2>💎 Quản Lý Gói</h2>
-        <form method="POST" action="/admin/packages">
-            <div class="form-group">
-                <label>JSON Gói (định dạng: {"Tên": {"price": 10000, "days": 30}})</label>
-                <textarea name="packages">{{ packages_json }}</textarea>
-            </div>
-            <button type="submit">💾 Lưu Gói</button>
-        </form>
-        
-        <h2>🔑 Tạo Key Mới</h2>
-        <form method="POST" action="/admin/key">
-            <div class="form-group">
-                <label>Chọn Gói</label>
-                <select name="package" required>
-                    <option value="">-- Chọn gói --</option>
-                    {% for pkg in packages_json %}{% endfor %}
-                </select>
-            </div>
-            <button type="submit">🆕 Tạo Key</button>
-        </form>
-        
-        {% if generated %}
-            <div class="success">✅ Key mới: <span class="code">{{ generated }}</span></div>
-        {% endif %}
-        
-        <h2>📋 Đơn Nạp Gần Đây</h2>
-        <div class="table-wrapper">
-            <table>
-                <tr>
-                    <th>#</th>
-                    <th>User ID</th>
-                    <th>Số Tiền</th>
-                    <th>Nội Dung</th>
-                    <th>Trạng Thái</th>
-                    <th>Thời Gian</th>
-                </tr>
-                {% for dep in deposits[:20] %}
-                <tr>
-                    <td>{{ dep.id }}</td>
-                    <td><span class="code">{{ dep.telegram_id }}</span></td>
-                    <td>{{ dep.amount }}đ</td>
-                    <td><span class="code">{{ dep.content }}</span></td>
-                    <td class="status-{{ dep.status }}">{{ dep.status }}</td>
-                    <td>{{ dep.created_at[:10] }}</td>
-                </tr>
-                {% endfor %}
-            </table>
-        </div>
-        
-        <h2>👥 User Gần Đây</h2>
-        <div class="table-wrapper">
-            <table>
-                <tr>
-                    <th>ID</th>
-                    <th>Username</th>
-                    <th>Tên</th>
-                    <th>Tham Gia</th>
-                    <th>Lần Cuối</th>
-                </tr>
-                {% for user in users[:20] %}
-                <tr>
-                    <td><span class="code">{{ user.telegram_id }}</span></td>
-                    <td>{{ user.username or '(chưa đặt)' }}</td>
-                    <td>{{ user.first_name or '(chưa đặt)' }}</td>
-                    <td>{{ user.created_at[:10] }}</td>
-                    <td>{{ user.last_seen[:10] }}</td>
-                </tr>
-                {% endfor %}
-            </table>
-        </div>
-        
-        <h2>🔑 Key Hoạt Động</h2>
-        <div class="table-wrapper">
-            <table>
-                <tr>
-                    <th>Key</th>
-                    <th>Gói</th>
-                    <th>User</th>
-                    <th>Hạn Dùng</th>
-                    <th>Trạng Thái</th>
-                </tr>
-                {% for key in keys[:30] %}
-                <tr>
-                    <td><span class="code">{{ key.key }}</span></td>
-                    <td>{{ key.package_name }}</td>
-                    <td>{{ key.username or key.first_name or (key.used_by if key.used_by else '(chưa dùng)') }}</td>
-                    <td>{{ key.expires_at[:10] if key.expires_at else '(chưa kích hoạt)' }}</td>
-                    <td>{{ '🔒 Khoá' if key.locked else ('✅ Hoạt' if key.used_by and key.expires_at > now_iso else '❌ Hết') }}</td>
-                </tr>
-                {% endfor %}
-            </table>
-        </div>
-    </div>
-</body>
-</html>
+<!doctype html><html lang='vi'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{{bot_name}} · Admin</title>
+<style>
+:root{--bg:#080d1c;--panel:#111a2e;--panel2:#16223a;--line:#263756;--text:#f4f7fb;--muted:#92a4c4;--blue:#4f7cff;--cyan:#27d3c2;--green:#31d18b;--orange:#ffb454;--red:#ff6b7a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% 0,#1c3262 0,transparent 34%),var(--bg);color:var(--text);font:14px Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.shell{display:flex;min-height:100vh}.side{width:245px;background:rgba(7,12,27,.86);border-right:1px solid var(--line);padding:25px 16px}.brand{display:flex;gap:12px;align-items:center;font-weight:800;font-size:16px;margin-bottom:35px}.logo{width:40px;height:40px;border-radius:13px;background:linear-gradient(135deg,var(--blue),var(--cyan));display:grid;place-items:center;font-weight:900}.nav{display:grid;gap:7px}.nav a{color:var(--muted);text-decoration:none;padding:12px 13px;border-radius:10px}.nav a:hover,.nav a.active{background:#182846;color:white}.content{flex:1;padding:28px 4.5vw 55px;max-width:1500px}.top{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:25px}.eyebrow{color:var(--cyan);text-transform:uppercase;letter-spacing:1.8px;font-size:11px;font-weight:800}.top h1{font-size:30px;margin:7px 0}.muted{color:var(--muted)}.notice{background:#302719;border:1px solid #725a31;color:#ffd990;padding:12px 15px;border-radius:12px;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.card,section{background:linear-gradient(145deg,rgba(22,34,58,.95),rgba(14,23,42,.95));border:1px solid var(--line);border-radius:16px;padding:19px;box-shadow:0 14px 35px #0002}.stat{font-size:28px;font-weight:800;margin:7px 0}.label{color:var(--muted);font-size:12px}.accent{color:var(--cyan)}.row{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}section h2{font-size:17px;margin:0 0 17px}label{display:block;color:var(--muted);font-size:12px;margin:11px 0 5px}input,textarea,select{width:100%;border:1px solid var(--line);border-radius:9px;background:#0c1529;color:var(--text);padding:11px 12px;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--blue)}button{border:0;border-radius:9px;background:linear-gradient(135deg,#4f7cff,#3560df);color:#fff;padding:11px 16px;font-weight:700;cursor:pointer;margin-top:14px}button:hover{filter:brightness(1.12)}.btn-green{background:linear-gradient(135deg,#20bd7a,#179c68)}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:12px 9px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-weight:600}.pill{display:inline-block;padding:5px 9px;border-radius:99px;font-size:11px;font-weight:700}.pending{background:#49391b;color:#ffd47c}.approved{background:#153e32;color:#67e5ae}.rejected{background:#472631;color:#ff9aa6}code{color:#8fe9ff;background:#0b1427;padding:3px 6px;border-radius:5px}.footer{color:#647594;font-size:12px;margin-top:18px}@media(max-width:900px){.side{width:190px}.grid{grid-template-columns:repeat(2,1fr)}.row{grid-template-columns:1fr}}@media(max-width:620px){.shell{display:block}.side{width:100%;border-right:0;border-bottom:1px solid var(--line);padding:16px}.brand{margin-bottom:12px}.nav{display:flex;overflow:auto}.content{padding:22px 15px}.grid{grid-template-columns:1fr 1fr}.top{display:block}}
+</style></head><body><div class='shell'><aside class='side'><div class='brand'><div class='logo'>TX</div><div>{{bot_name}}<div class='muted' style='font-size:11px;margin-top:3px'>CONTROL CENTER</div></div></div><nav class='nav'><a class='active' href='#overview'>▦ Tổng quan</a><a href='#runtime'>⚙ Cấu hình bot</a><a href='#bank'>◈ VietQR & ngân hàng</a><a href='#packages'>◇ Gói key</a><a href='#deposits'>⇄ Đơn nạp</a><a href='#users'>👥 Người dùng</a><a href='#keys'>✦ Tạo key</a></nav></aside><main class='content'><header class='top'><div><div class='eyebrow'>Management dashboard</div><h1>Xin chào, quản trị viên</h1><div class='muted'>Quản lý bot, giao dịch và key trong một nơi.</div></div><div class='pill {{"approved" if bot_ready else "pending"}}'>● {{'BOT ĐANG CHẠY' if bot_ready else 'CHỜ CẤU HÌNH BOT'}}</div></header><div class='notice'><b>Lưu ý bảo mật:</b> giao diện này không có đăng nhập theo yêu cầu ban đầu. Không chia sẻ URL admin công khai.</div><div id='overview' class='grid'><div class='card'><div class='label'>NGƯỜI DÙNG</div><div class='stat'>{{stats.users}}</div><div class='muted'>tài khoản đã đăng ký</div></div><div class='card'><div class='label'>KEY CHƯA DÙNG</div><div class='stat accent'>{{stats.unused_keys}}</div><div class='muted'>sẵn sàng cấp</div></div><div class='card'><div class='label'>ĐƠN CHỜ DUYỆT</div><div class='stat' style='color:var(--orange)'>{{stats.pending}}</div><div class='muted'>cần kiểm tra</div></div><div class='card'><div class='label'>DOANH THU ĐÃ DUYỆT</div><div class='stat' style='color:var(--green)'>{{stats.revenue}}</div><div class='muted'>tổng tiền nạp</div></div></div><div id='runtime' class='row'><section><h2>⚙ Cấu hình bot</h2><form method='post' action='/admin/runtime'><label>Bot Token từ BotFather</label><input type='password' name='bot_token' placeholder='Dán token có dạng 123456:AA...' value='{{token_value}}'><label>Telegram ID admin</label><input name='admin_ids' placeholder='Ví dụ: 123456789,987654321' value='{{admin_ids}}'><button class='btn-green'>Lưu & khởi động bot</button></form></section><section id='bank'><h2>◈ Tài khoản nhận tiền</h2><form method='post' action='/admin/bank'><label>Mã ngân hàng</label><input name='bank_code' value='{{bank.bank_code}}'><label>Số tài khoản</label><input name='account_no' value='{{bank.account_no}}'><label>Tên chủ tài khoản</label><input name='account_name' value='{{bank.account_name}}'><label>Tiền tố nội dung</label><input name='note_prefix' value='{{bank.note_prefix}}'><label>Link liên hệ admin</label><input name='contact_link' type='url' placeholder='https://t.me/ten_admin' value='{{bank.contact_link}}'><button>Lưu thông tin VietQR & liên hệ</button></form></section></div><section id='packages'><h2>◇ Quản lý gói key</h2><div class='muted'>Nhập tên gói, giá tiền và số ngày rồi bấm thêm. Không cần sửa JSON.</div><form method='post' action='/admin/package/add' style='display:grid;grid-template-columns:1.3fr 1fr 1fr auto;gap:10px;align-items:end'><div><label>Tên gói</label><input name='name' placeholder='Ví dụ: Gói VIP 7 ngày' required></div><div><label>Giá tiền</label><input name='price' type='number' min='0' placeholder='50000' required></div><div><label>Số ngày</label><input name='days' type='number' min='1' placeholder='7' required></div><button>＋ Thêm gói</button></form><div style='overflow:auto;margin-top:18px'><table><tr><th>Tên gói</th><th>Giá</th><th>Thời hạn</th><th></th></tr>{% for n,p in packages.items() %}<tr><td><b>{{n}}</b></td><td>{{p.price}}</td><td>{{p.days}} ngày</td><td><form method='post' action='/admin/package/delete'><input type='hidden' name='name' value='{{n}}'><button style='background:linear-gradient(135deg,#e65b6e,#b7354b);margin:0'>Xóa</button></form></td></tr>{% else %}<tr><td colspan='4' class='muted'>Chưa có gói.</td></tr>{% endfor %}</table></div></section><section id='deposits' style='margin-top:18px'><h2>⇄ 100 đơn nạp gần nhất</h2><div style='overflow:auto'><table><tr><th>ID</th><th>Telegram ID</th><th>Số tiền</th><th>Nội dung</th><th>Trạng thái</th><th>Thời gian</th></tr>{% for d in deposits %}<tr><td>#{{d.id}}</td><td>{{d.telegram_id}}</td><td><b>{{d.amount}}</b></td><td><code>{{d.content}}</code></td><td><span class='pill {{d.status}}'>{{d.status}}</span></td><td class='muted'>{{d.created_at[:19]}}</td></tr>{% else %}<tr><td colspan='6' class='muted'>Chưa có đơn nạp.</td></tr>{% endfor %}</table></div></section><section id='users' style='margin-top:18px'><h2>👥 Quản lý người dùng & số dư</h2><div style='overflow:auto'><table><tr><th>Telegram ID</th><th>Tên</th><th>Username</th><th>Số dư</th><th>Cộng / trừ tiền</th></tr>{% for u in users %}<tr><td><code>{{u.telegram_id}}</code></td><td>{{u.first_name}}</td><td>@{{u.username}}</td><td><b>{{u.balance}}</b></td><td><form method='post' action='/admin/user/balance' style='display:flex;gap:6px;min-width:290px'><input type='hidden' name='telegram_id' value='{{u.telegram_id}}'><input name='amount' type='number' placeholder='10000' required><button style='margin:0'>Cộng</button><button name='mode' value='subtract' style='margin:0;background:linear-gradient(135deg,#e65b6e,#b7354b)'>Trừ</button></form></td></tr>{% else %}<tr><td colspan='5' class='muted'>Chưa có user.</td></tr>{% endfor %}</table></div></section><section id='keys' style='margin-top:18px'><h2>✦ Quản lý key đang chạy</h2><div class='muted'>Key đang chạy được hiển thị đầu tiên. Khóa key sẽ ngăn kích hoạt mới và vô hiệu hóa key đang dùng; mở khóa cho phép sử dụng lại nếu còn hạn.</div><div style='overflow:auto;margin-top:14px'><table><tr><th>Key</th><th>Gói</th><th>Người dùng</th><th>Hạn dùng</th><th>Trạng thái</th><th>Thao tác</th></tr>{% for k in keys %}<tr><td><code>{{k.key}}</code></td><td>{{k.package_name}}</td><td>{% if k.used_by %}<code>{{k.used_by}}</code>{% else %}<span class='muted'>Chưa dùng</span>{% endif %}</td><td class='muted'>{{k.expires_at or '—'}}</td><td><span class='pill {{'rejected' if k.locked else ('approved' if k.used_by and k.expires_at and k.expires_at > now_iso else 'pending')}}'>{{'ĐANG KHÓA' if k.locked else ('ĐANG CHẠY' if k.used_by and k.expires_at and k.expires_at > now_iso else ('ĐÃ CẤP' if k.used_by else 'CHƯA DÙNG'))}}</span></td><td style='white-space:nowrap'><form method='post' action='/admin/key/toggle' style='display:inline'><input type='hidden' name='key' value='{{k.key}}'><button style='margin:0;background:linear-gradient(135deg,#ffb454,#d98222)'>{{'Mở khóa' if k.locked else 'Khóa'}}</button></form> <form method='post' action='/admin/key/delete' style='display:inline' onsubmit="return confirm('Xóa key này?')"><input type='hidden' name='key' value='{{k.key}}'><button style='margin:0;background:linear-gradient(135deg,#e65b6e,#b7354b)'>Xóa</button></form></td></tr>{% else %}<tr><td colspan='6' class='muted'>Chưa có key.</td></tr>{% endfor %}</table></div><div class='row' style='margin-top:18px'><section><h2>✦ Tạo key nhanh</h2><form method='post' action='/admin/key'><label>Chọn gói</label><select name='package'>{% for n in packages %}<option>{{n}}</option>{% endfor %}</select><button>Tạo key mới</button></form>{% if generated %}<div style='margin-top:18px'>Key mới: <code>{{generated}}</code></div>{% endif %}</section><section><h2>Trạng thái hệ thống</h2><div class='muted'>Health endpoint</div><p><span class='pill approved'>● ONLINE</span> <code>/</code></p><div class='muted'>Database</div><p><span class='pill approved'>● READY</span> SQLite</p></section></div><div class='footer'>{{bot_name}} · Admin Control Center · Dữ liệu được lưu trong SQLite</div></main></div></body></html>
 """
 
 @app.get("/")
@@ -1093,7 +945,7 @@ def admin_package_add():
 @app.post("/admin/package/delete")
 def admin_package_delete():
     packages = get_setting("packages", DEFAULT_PACKAGES); packages.pop(request.form.get("name", ""), None); set_setting("packages", packages)
-    return redirect("/admin")
+    return redirect("/admin#packages")
 
 @app.post("/admin/user/balance")
 def admin_user_balance():
