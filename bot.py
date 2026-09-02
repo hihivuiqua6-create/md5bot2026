@@ -171,6 +171,18 @@ def is_admin(uid):
     return uid in ADMIN_IDS and uid != 0
 
 
+def telegram_polling_loop():
+    """Chạy polling có log lỗi và tự thử lại khi kết nối Telegram bị ngắt."""
+    while True:
+        try:
+            # Bảo đảm bot dùng long polling, không bị webhook cũ chặn nhận /start.
+            bot.remove_webhook()
+            bot.infinity_polling(skip_pending=False, timeout=30, long_polling_timeout=30)
+        except Exception:
+            log.exception("Telegram polling bị dừng; kiểm tra token hoặc có tiến trình khác đang dùng bot")
+            time.sleep(5)
+
+
 def start_bot_if_configured():
     """Nạp cấu hình từ DB và bật polling một lần; không có token thì chỉ chạy web admin."""
     global _polling_started
@@ -179,13 +191,14 @@ def start_bot_if_configured():
     ADMIN_IDS.clear()
     ADMIN_IDS.update(int(x) for x in configured_ids if str(x).strip().lstrip("-").isdigit() and int(x) != 0)
     if not token:
+        log.error("BOT_TOKEN đang trống; bot chỉ chạy trang admin")
         return False
     with _polling_lock:
         if _polling_started:
             return True
         bot.token = token
         _polling_started = True
-        threading.Thread(target=lambda: bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30), daemon=True, name="telegram-polling").start()
+        threading.Thread(target=telegram_polling_loop, daemon=True, name="telegram-polling").start()
     log.info("Telegram polling đã khởi động; admin IDs=%s", sorted(ADMIN_IDS))
     return True
 
