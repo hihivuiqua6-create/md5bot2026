@@ -40,11 +40,13 @@ DEFAULT_PACKAGES = {
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("md5tx")
 
-if not BOT_TOKEN:
-    raise RuntimeError("Thiếu BOT_TOKEN. Hãy tạo biến môi trường BOT_TOKEN trên Render.")
-
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
+# Token có thể nhập sau tại /admin. Placeholder chỉ để TeleBot đăng ký handler.
+# Khi chưa cấu hình, Render vẫn giữ web admin hoạt động thay vì crash.
+_RUNTIME_PLACEHOLDER = "000000:CONFIGURE_IN_ADMIN"
+bot = telebot.TeleBot(BOT_TOKEN or _RUNTIME_PLACEHOLDER, parse_mode="HTML", threaded=True)
 app = Flask(__name__)
+_polling_started = False
+_polling_lock = threading.Lock()
 
 # ============================================================
 # DATABASE: SQLite để đáp ứng yêu cầu chỉ 2 file
@@ -82,6 +84,10 @@ def init_db():
             c.execute("INSERT INTO settings(key,value) VALUES('bank',?)", (json.dumps(DEFAULT_BANK),))
         if c.execute("SELECT 1 FROM settings WHERE key='packages'").fetchone() is None:
             c.execute("INSERT INTO settings(key,value) VALUES('packages',?)", (json.dumps(DEFAULT_PACKAGES),))
+        if c.execute("SELECT 1 FROM settings WHERE key='bot_token'").fetchone() is None:
+            c.execute("INSERT INTO settings(key,value) VALUES('bot_token',?)", (json.dumps(BOT_TOKEN),))
+        if c.execute("SELECT 1 FROM settings WHERE key='admin_ids'").fetchone() is None:
+            c.execute("INSERT INTO settings(key,value) VALUES('admin_ids',?)", (json.dumps(sorted(x for x in ADMIN_IDS if x != 0)),))
 
 
 def now():
@@ -110,6 +116,25 @@ def set_setting(key, value):
 
 def is_admin(uid):
     return uid in ADMIN_IDS and uid != 0
+
+
+def start_bot_if_configured():
+    """Nạp cấu hình từ DB và bật polling một lần; không có token thì chỉ chạy web admin."""
+    global _polling_started
+    token = str(get_setting("bot_token", BOT_TOKEN) or "").strip()
+    configured_ids = get_setting("admin_ids", sorted(x for x in ADMIN_IDS if x != 0))
+    ADMIN_IDS.clear()
+    ADMIN_IDS.update(int(x) for x in configured_ids if str(x).strip().lstrip("-").isdigit() and int(x) != 0)
+    if not token:
+        return False
+    with _polling_lock:
+        if _polling_started:
+            return True
+        bot.token = token
+        _polling_started = True
+        threading.Thread(target=lambda: bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30), daemon=True, name="telegram-polling").start()
+    log.info("Telegram polling đã khởi động; admin IDs=%s", sorted(ADMIN_IDS))
+    return True
 
 
 def register_user(message):
@@ -484,13 +509,10 @@ def decide_deposit(uid, did, approved):
 # ADMIN WEB KHÔNG ĐĂNG NHẬP — CHỈ DÙNG MÔI TRƯỜNG RIÊNG
 # ============================================================
 ADMIN_HTML = """
-<!doctype html><meta charset='utf-8'><title>MD5 TX Admin</title>
-<style>body{font-family:Arial;max-width:1050px;margin:30px auto;background:#101827;color:#e5e7eb}input,textarea{width:100%;padding:9px;margin:5px 0 12px;background:#172235;color:white;border:1px solid #475569}button{padding:9px 14px;margin:4px;background:#2563eb;color:white;border:0;border-radius:5px}section{background:#172235;padding:18px;margin:14px 0;border-radius:8px}table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #334155;text-align:left}</style>
-<h1>MD5 Tài Xỉu — Admin</h1><p><b>Cảnh báo:</b> trang này không có đăng nhập theo yêu cầu. Không chia sẻ URL quản trị công khai.</p>
-<section><h2>Ngân hàng / VietQR</h2><form method='post' action='/admin/bank'><input name='bank_code' placeholder='Mã ngân hàng' value='{{bank.bank_code}}'><input name='account_no' placeholder='Số tài khoản' value='{{bank.account_no}}'><input name='account_name' placeholder='Tên tài khoản' value='{{bank.account_name}}'><input name='note_prefix' placeholder='Tiền tố nội dung' value='{{bank.note_prefix}}'><button>Lưu ngân hàng</button></form></section>
-<section><h2>Gói key</h2><form method='post' action='/admin/packages'><textarea name='packages' rows='8'>{{packages_json}}</textarea><p>JSON mẫu: {"Gói 1 ngày":{"price":10000,"days":1}}</p><button>Lưu gói</button></form></section>
-<section><h2>Đơn nạp chờ duyệt</h2><table><tr><th>ID</th><th>User</th><th>Số tiền</th><th>Nội dung</th><th>Trạng thái</th></tr>{% for d in deposits %}<tr><td>{{d.id}}</td><td>{{d.telegram_id}}</td><td>{{d.amount}}</td><td>{{d.content}}</td><td>{{d.status}}</td></tr>{% endfor %}</table></section>
-<section><h2>Tạo key nhanh</h2><form method='post' action='/admin/key'><select name='package'>{% for n in packages %}<option>{{n}}</option>{% endfor %}</select><button>Tạo key</button></form>{% if generated %}<p>Key mới: <code>{{generated}}</code></p>{% endif %}</section>
+<!doctype html><html lang='vi'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{{bot_name}} · Admin</title>
+<style>
+:root{--bg:#080d1c;--panel:#111a2e;--panel2:#16223a;--line:#263756;--text:#f4f7fb;--muted:#92a4c4;--blue:#4f7cff;--cyan:#27d3c2;--green:#31d18b;--orange:#ffb454;--red:#ff6b7a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% 0,#1c3262 0,transparent 34%),var(--bg);color:var(--text);font:14px Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.shell{display:flex;min-height:100vh}.side{width:245px;background:rgba(7,12,27,.86);border-right:1px solid var(--line);padding:25px 16px}.brand{display:flex;gap:12px;align-items:center;font-weight:800;font-size:16px;margin-bottom:35px}.logo{width:40px;height:40px;border-radius:13px;background:linear-gradient(135deg,var(--blue),var(--cyan));display:grid;place-items:center;font-weight:900}.nav{display:grid;gap:7px}.nav a{color:var(--muted);text-decoration:none;padding:12px 13px;border-radius:10px}.nav a:hover,.nav a.active{background:#182846;color:white}.content{flex:1;padding:28px 4.5vw 55px;max-width:1500px}.top{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:25px}.eyebrow{color:var(--cyan);text-transform:uppercase;letter-spacing:1.8px;font-size:11px;font-weight:800}.top h1{font-size:30px;margin:7px 0}.muted{color:var(--muted)}.notice{background:#302719;border:1px solid #725a31;color:#ffd990;padding:12px 15px;border-radius:12px;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.card,section{background:linear-gradient(145deg,rgba(22,34,58,.95),rgba(14,23,42,.95));border:1px solid var(--line);border-radius:16px;padding:19px;box-shadow:0 14px 35px #0002}.stat{font-size:28px;font-weight:800;margin:7px 0}.label{color:var(--muted);font-size:12px}.accent{color:var(--cyan)}.row{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}section h2{font-size:17px;margin:0 0 17px}label{display:block;color:var(--muted);font-size:12px;margin:11px 0 5px}input,textarea,select{width:100%;border:1px solid var(--line);border-radius:9px;background:#0c1529;color:var(--text);padding:11px 12px;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--blue)}button{border:0;border-radius:9px;background:linear-gradient(135deg,#4f7cff,#3560df);color:#fff;padding:11px 16px;font-weight:700;cursor:pointer;margin-top:14px}button:hover{filter:brightness(1.12)}.btn-green{background:linear-gradient(135deg,#20bd7a,#179c68)}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:12px 9px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-weight:600}.pill{display:inline-block;padding:5px 9px;border-radius:99px;font-size:11px;font-weight:700}.pending{background:#49391b;color:#ffd47c}.approved{background:#153e32;color:#67e5ae}.rejected{background:#472631;color:#ff9aa6}code{color:#8fe9ff;background:#0b1427;padding:3px 6px;border-radius:5px}.footer{color:#647594;font-size:12px;margin-top:18px}@media(max-width:900px){.side{width:190px}.grid{grid-template-columns:repeat(2,1fr)}.row{grid-template-columns:1fr}}@media(max-width:620px){.shell{display:block}.side{width:100%;border-right:0;border-bottom:1px solid var(--line);padding:16px}.brand{margin-bottom:12px}.nav{display:flex;overflow:auto}.content{padding:22px 15px}.grid{grid-template-columns:1fr 1fr}.top{display:block}}
+</style></head><body><div class='shell'><aside class='side'><div class='brand'><div class='logo'>TX</div><div>{{bot_name}}<div class='muted' style='font-size:11px;margin-top:3px'>CONTROL CENTER</div></div></div><nav class='nav'><a class='active' href='#overview'>▦ Tổng quan</a><a href='#runtime'>⚙ Cấu hình bot</a><a href='#bank'>◈ VietQR & ngân hàng</a><a href='#packages'>◇ Gói key</a><a href='#deposits'>⇄ Đơn nạp</a><a href='#keys'>✦ Tạo key</a></nav></aside><main class='content'><header class='top'><div><div class='eyebrow'>Management dashboard</div><h1>Xin chào, quản trị viên</h1><div class='muted'>Quản lý bot, giao dịch và key trong một nơi.</div></div><div class='pill {{"approved" if bot_ready else "pending"}}'>● {{'BOT ĐANG CHẠY' if bot_ready else 'CHỜ CẤU HÌNH BOT'}}</div></header><div class='notice'><b>Lưu ý bảo mật:</b> giao diện này không có đăng nhập theo yêu cầu ban đầu. Không chia sẻ URL admin công khai.</div><div id='overview' class='grid'><div class='card'><div class='label'>NGƯỜI DÙNG</div><div class='stat'>{{stats.users}}</div><div class='muted'>tài khoản đã đăng ký</div></div><div class='card'><div class='label'>KEY CHƯA DÙNG</div><div class='stat accent'>{{stats.unused_keys}}</div><div class='muted'>sẵn sàng cấp</div></div><div class='card'><div class='label'>ĐƠN CHỜ DUYỆT</div><div class='stat' style='color:var(--orange)'>{{stats.pending}}</div><div class='muted'>cần kiểm tra</div></div><div class='card'><div class='label'>DOANH THU ĐÃ DUYỆT</div><div class='stat' style='color:var(--green)'>{{stats.revenue}}</div><div class='muted'>tổng tiền nạp</div></div></div><div id='runtime' class='row'><section><h2>⚙ Cấu hình bot</h2><form method='post' action='/admin/runtime'><label>Bot Token từ BotFather</label><input type='password' name='bot_token' placeholder='Dán token có dạng 123456:AA...' value='{{token_value}}'><label>Telegram ID admin</label><input name='admin_ids' placeholder='Ví dụ: 123456789,987654321' value='{{admin_ids}}'><button class='btn-green'>Lưu & khởi động bot</button></form></section><section id='bank'><h2>◈ Tài khoản nhận tiền</h2><form method='post' action='/admin/bank'><label>Mã ngân hàng</label><input name='bank_code' value='{{bank.bank_code}}'><label>Số tài khoản</label><input name='account_no' value='{{bank.account_no}}'><label>Tên chủ tài khoản</label><input name='account_name' value='{{bank.account_name}}'><label>Tiền tố nội dung</label><input name='note_prefix' value='{{bank.note_prefix}}'><button>Lưu thông tin VietQR</button></form></section></div><section id='packages'><h2>◇ Gói key & giá bán</h2><div class='muted'>Mỗi dòng JSON gồm giá tiền (price) và số ngày (days).</div><form method='post' action='/admin/packages'><textarea name='packages' rows='7'>{{packages_json}}</textarea><button>Lưu danh sách gói</button></form></section><section id='deposits' style='margin-top:18px'><h2>⇄ 100 đơn nạp gần nhất</h2><div style='overflow:auto'><table><tr><th>ID</th><th>Telegram ID</th><th>Số tiền</th><th>Nội dung</th><th>Trạng thái</th><th>Thời gian</th></tr>{% for d in deposits %}<tr><td>#{{d.id}}</td><td>{{d.telegram_id}}</td><td><b>{{d.amount}}</b></td><td><code>{{d.content}}</code></td><td><span class='pill {{d.status}}'>{{d.status}}</span></td><td class='muted'>{{d.created_at[:19]}}</td></tr>{% else %}<tr><td colspan='6' class='muted'>Chưa có đơn nạp.</td></tr>{% endfor %}</table></div></section><div id='keys' class='row' style='margin-top:18px'><section><h2>✦ Tạo key nhanh</h2><form method='post' action='/admin/key'><label>Chọn gói</label><select name='package'>{% for n in packages %}<option>{{n}}</option>{% endfor %}</select><button>Tạo key mới</button></form>{% if generated %}<div style='margin-top:18px'>Key mới: <code>{{generated}}</code></div>{% endif %}</section><section><h2>Trạng thái hệ thống</h2><div class='muted'>Health endpoint</div><p><span class='pill approved'>● ONLINE</span> <code>/</code></p><div class='muted'>Database</div><p><span class='pill approved'>● READY</span> SQLite</p></section></div><div class='footer'>{{bot_name}} · Admin Control Center · Dữ liệu được lưu trong SQLite</div></main></div></body></html>
 """
 
 @app.get("/")
@@ -498,9 +520,36 @@ def health(): return jsonify(ok=True, service=BOT_NAME, time=iso(now()))
 
 @app.get("/admin")
 def admin_page():
-    with db() as c: deposits = c.execute("SELECT * FROM deposits ORDER BY id DESC LIMIT 100").fetchall()
+    with db() as c:
+        deposits = c.execute("SELECT * FROM deposits ORDER BY id DESC LIMIT 100").fetchall()
+        stats = {
+            "users": c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],
+            "unused_keys": c.execute("SELECT COUNT(*) n FROM keys WHERE used_by IS NULL").fetchone()["n"],
+            "pending": c.execute("SELECT COUNT(*) n FROM deposits WHERE status='pending'").fetchone()["n"],
+            "revenue": fmt_money(c.execute("SELECT COALESCE(SUM(amount),0) s FROM deposits WHERE status='approved'").fetchone()["s"]),
+        }
     packages = get_setting("packages", DEFAULT_PACKAGES); bank = get_setting("bank", DEFAULT_BANK)
-    return render_template_string(ADMIN_HTML, deposits=deposits, packages=packages, bank=bank, packages_json=json.dumps(packages, ensure_ascii=False, indent=2), generated=request.args.get("generated", ""))
+    token = str(get_setting("bot_token", BOT_TOKEN) or "")
+    ids = get_setting("admin_ids", sorted(x for x in ADMIN_IDS if x != 0))
+    return render_template_string(ADMIN_HTML, bot_name=BOT_NAME, bot_ready=bool(token), deposits=deposits, packages=packages, bank=bank, stats=stats, admin_ids=','.join(map(str, ids)), token_value="", packages_json=json.dumps(packages, ensure_ascii=False, indent=2), generated=request.args.get("generated", ""))
+
+@app.post("/admin/runtime")
+def admin_runtime():
+    token = request.form.get("bot_token", "").strip()
+    old_token = str(get_setting("bot_token", BOT_TOKEN) or "")
+    if token:
+        if ":" not in token:
+            return "BOT_TOKEN không hợp lệ: token phải có dấu hai chấm (:).", 400
+        set_setting("bot_token", token)
+    elif not old_token:
+        return "Hãy nhập BOT_TOKEN từ BotFather.", 400
+    raw_ids = request.form.get("admin_ids", "")
+    ids = [int(x.strip()) for x in raw_ids.replace(";", ",").split(",") if x.strip().lstrip("-").isdigit() and int(x.strip()) != 0]
+    if not ids:
+        return "Hãy nhập ít nhất một Telegram ID admin.", 400
+    set_setting("admin_ids", ids)
+    start_bot_if_configured()
+    return redirect("/admin")
 
 @app.post("/admin/bank")
 def admin_bank():
@@ -537,6 +586,9 @@ def run_web():
 
 if __name__ == "__main__":
     init_db()
-    threading.Thread(target=run_web, daemon=True).start()
-    log.info("Bot starting on port %s", PORT)
-    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+    # Luôn mở web admin trước. Token có thể nhập từ /admin sau khi Render chạy.
+    start_bot_if_configured()
+    threading.Thread(target=run_web, daemon=True, name="flask-admin").start()
+    log.info("Admin web đang chạy trên port %s; bot_ready=%s", PORT, _polling_started)
+    while True:
+        time.sleep(3600)
