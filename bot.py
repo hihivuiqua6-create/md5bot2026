@@ -19,8 +19,8 @@ from flask import Flask, request, redirect, render_template_string, jsonify
 # ============================================================
 # CẤU HÌNH QUA BIẾN MÔI TRƯỜNG
 # ============================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.strip().lstrip("-").isdigit()}
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8477166662:AAHpUmD1-p9iPWIyvhKy_5I9Hc7sQkjwbU0").strip()
+ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "8030294480").split(",") if x.strip().lstrip("-").isdigit()}
 PORT = int(os.getenv("PORT", "10000"))
 DB_PATH = os.getenv("DB_PATH", "bot.sqlite3")
 BOT_NAME = os.getenv("BOT_NAME", "MD5 Tài Xỉu Pro")
@@ -31,13 +31,16 @@ DEFAULT_BANK = {
     "account_no": os.getenv("BANK_ACCOUNT_NO", "0000000000"),
     "account_name": os.getenv("BANK_ACCOUNT_NAME", "CHU TAI KHOAN"),
     "note_prefix": os.getenv("BANK_NOTE_PREFIX", "NAPTX"),
-    "contact_link": os.getenv("CONTACT_LINK", "https://t.me/"),
+    "contact_link": os.getenv("CONTACT_LINK", "https://t.me/auzasito"),
 }
 DEFAULT_PACKAGES = {
-    "Gói 1 ngày": {"price": 10000, "days": 1},
-    "Gói 7 ngày": {"price": 50000, "days": 7},
-    "Gói 30 ngày": {"price": 150000, "days": 30},
+    "Gói 1 Ngày": {"price": 20000, "days": 1},
+    "Gói 3 Ngày": {"price": 40000, "days": 3},
+    "Gói 7 Ngày": {"price": 70000, "days": 7},
+    "Gói 1 Tháng": {"price": 90000, "days": 31},
+    "Gói Vĩnh Viễn ( Sale )": {"price": 50000, "days": 9999999999999},
 }
+PACKAGE_CONFIG_VERSION = 2
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("md5tx")
@@ -105,6 +108,27 @@ def init_db():
             c.execute("INSERT INTO settings(key,value) VALUES('bot_token',?)", (json.dumps(BOT_TOKEN),))
         if c.execute("SELECT 1 FROM settings WHERE key='admin_ids'").fetchone() is None:
             c.execute("INSERT INTO settings(key,value) VALUES('admin_ids',?)", (json.dumps(sorted(x for x in ADMIN_IDS if x != 0)),))
+        # Đồng bộ một lần cho database cũ để giá gói, token, admin và link mới
+        # được áp dụng ngay; các chỉnh sửa về sau trong trang admin vẫn được giữ.
+        version_row = c.execute("SELECT value FROM settings WHERE key='config_version'").fetchone()
+        try:
+            config_version = int(json.loads(version_row["value"])) if version_row else 0
+        except (TypeError, ValueError, json.JSONDecodeError):
+            config_version = 0
+        if config_version < PACKAGE_CONFIG_VERSION:
+            c.execute("INSERT INTO settings(key,value) VALUES('packages',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(DEFAULT_PACKAGES, ensure_ascii=False),))
+            c.execute("INSERT INTO settings(key,value) VALUES('bot_token',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(BOT_TOKEN),))
+            c.execute("INSERT INTO settings(key,value) VALUES('admin_ids',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(sorted(x for x in ADMIN_IDS if x != 0)),))
+            existing_bank = c.execute("SELECT value FROM settings WHERE key='bank'").fetchone()
+            try:
+                bank = json.loads(existing_bank["value"]) if existing_bank else dict(DEFAULT_BANK)
+                if not isinstance(bank, dict):
+                    bank = dict(DEFAULT_BANK)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                bank = dict(DEFAULT_BANK)
+            bank["contact_link"] = DEFAULT_BANK["contact_link"]
+            c.execute("INSERT INTO settings(key,value) VALUES('bank',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(bank, ensure_ascii=False),))
+            c.execute("INSERT INTO settings(key,value) VALUES('config_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(PACKAGE_CONFIG_VERSION),))
 
 
 def now():
@@ -113,6 +137,18 @@ def now():
 
 def iso(dt):
     return dt.astimezone(timezone.utc).isoformat()
+
+
+PERMANENT_DAYS_THRESHOLD = 1_000_000
+PERMANENT_EXPIRY = "9999-12-31T23:59:59+00:00"
+
+
+def expiry_from_days(days):
+    """Tính hạn dùng an toàn, tránh OverflowError với gói vĩnh viễn."""
+    days = int(days)
+    if days >= PERMANENT_DAYS_THRESHOLD:
+        return PERMANENT_EXPIRY
+    return iso(now() + timedelta(days=days))
 
 
 def get_setting(key, default):
@@ -608,29 +644,40 @@ def buy_package(cid, name, call=None):
 
 
 def purchase_package(uid, name, call=None):
-    packages = get_setting("packages", DEFAULT_PACKAGES); p = packages.get(name)
+    packages = get_setting("packages", DEFAULT_PACKAGES)
+    p = packages.get(name)
     if not p:
-        text = "❌ Gói không tồn tại."
+        text = "❌ Gói không tồn tại hoặc nút mua đã cũ. Vui lòng mở lại danh sách gói."
     else:
-        with db() as c:
-            c.execute("BEGIN IMMEDIATE")
-            u = c.execute("SELECT COALESCE(balance,0) balance FROM users WHERE telegram_id=?", (uid,)).fetchone()
-            balance = int(u["balance"] if u else 0)
-            price = int(p["price"]); days = int(p["days"])
-            if balance < price:
-                text = f"❌ Số dư không đủ. Bạn có <b>{fmt_money(balance)}</b>, cần <b>{fmt_money(price)}</b>."
-            else:
-                # Tự sinh key mới trong cùng transaction; không cần kho key tạo trước.
-                changed = c.execute("UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?", (price, uid, price)).rowcount
-                if changed != 1:
-                    text = "⚠️ Giao dịch đã được xử lý hoặc số dư thay đổi. Vui lòng mở lại Mua gói."
+        try:
+            price = int(p["price"])
+            days = int(p["days"])
+        except (KeyError, TypeError, ValueError):
+            text = "❌ Cấu hình gói không hợp lệ. Vui lòng báo admin."
+        else:
+            with db() as c:
+                # Khóa transaction để tránh hai lần bấm xác nhận cùng lúc cùng trừ tiền.
+                c.execute("BEGIN IMMEDIATE")
+                u = c.execute("SELECT COALESCE(balance,0) AS balance FROM users WHERE telegram_id=?", (uid,)).fetchone()
+                if u is None:
+                    c.execute("INSERT INTO users(telegram_id,username,first_name,balance,created_at,last_seen) VALUES(?,?,?,?,?,?)", (uid, "", "", 0, iso(now()), iso(now())))
+                    balance = 0
                 else:
-                    created = iso(now()); exp = iso(now() + timedelta(days=days))
-                    count = c.execute("SELECT COUNT(*) n FROM keys").fetchone()["n"] + 1
-                    seed = f"{BOT_TOKEN}:{uid}:{name}:{count}:{time.time_ns()}".encode()
-                    key_value = "TX-" + hashlib.sha256(seed).hexdigest()[:20].upper()
-                    c.execute("INSERT INTO keys(key,package_name,days,used_by,created_at,used_at,expires_at) VALUES(?,?,?,?,?,?,?)", (key_value, name, days, uid, created, created, exp))
-                    text = f"✅ <b>MUA KEY THÀNH CÔNG</b>\n\n💎 Gói: <b>{html.escape(name)}</b>\n🔑 Key mới của bạn: <code>{key_value}</code>\n⏳ Hạn dùng: <code>{exp}</code>\n💳 Số dư còn lại: <b>{fmt_money(balance-price)}</b>"
+                    balance = int(u["balance"] or 0)
+                if balance < price:
+                    text = f"❌ Số dư không đủ. Bạn có <b>{fmt_money(balance)}</b>, cần <b>{fmt_money(price)}</b>."
+                else:
+                    changed = c.execute("UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?", (price, uid, price)).rowcount
+                    if changed != 1:
+                        text = "⚠️ Giao dịch đã được xử lý hoặc số dư thay đổi. Vui lòng mở lại Mua gói."
+                    else:
+                        created = iso(now())
+                        exp = expiry_from_days(days)
+                        count = c.execute("SELECT COUNT(*) n FROM keys").fetchone()["n"] + 1
+                        seed = f"{BOT_TOKEN}:{uid}:{name}:{count}:{time.time_ns()}".encode()
+                        key_value = "TX-" + hashlib.sha256(seed).hexdigest()[:20].upper()
+                        c.execute("INSERT INTO keys(key,package_name,days,used_by,created_at,used_at,expires_at) VALUES(?,?,?,?,?,?,?)", (key_value, name, days, uid, created, created, exp))
+                        text = f"✅ <b>MUA KEY THÀNH CÔNG</b>\n\n💎 Gói: <b>{html.escape(name)}</b>\n🔑 Key mới của bạn: <code>{key_value}</code>\n⏳ Hạn dùng: <code>{exp}</code>\n💳 Số dư còn lại: <b>{fmt_money(balance-price)}</b>"
     k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🎮 Chơi ngay", callback_data="play"), types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
     if call: edit_page(call, text, k)
     else: bot.send_message(uid, text, reply_markup=k)
@@ -713,7 +760,7 @@ def activate_key(message):
         row = c.execute("SELECT * FROM keys WHERE key=?", (key,)).fetchone()
         if not row or row["used_by"] is not None or row["locked"]:
             bot.send_message(message.chat.id, "❌ Key không đúng, đã được sử dụng hoặc đang bị khóa."); return
-        exp = iso(now() + timedelta(days=int(row["days"])))
+        exp = expiry_from_days(int(row["days"]))
         c.execute("UPDATE keys SET used_by=?,used_at=?,expires_at=? WHERE key=?", (message.chat.id, iso(now()), exp, key))
     bot.send_message(message.chat.id, f"✅ <b>Kích hoạt key thành công!</b>\n\n💎 Gói: <b>{html.escape(row['package_name'])}</b>\n⏳ Hạn đến: <code>{exp}</code>")
 
