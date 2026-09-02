@@ -437,24 +437,22 @@ def purchase_package(uid, name, call=None):
         with db() as c:
             c.execute("BEGIN IMMEDIATE")
             u = c.execute("SELECT COALESCE(balance,0) balance FROM users WHERE telegram_id=?", (uid,)).fetchone()
-            key = c.execute("SELECT * FROM keys WHERE package_name=? AND used_by IS NULL ORDER BY created_at LIMIT 1", (name,)).fetchone()
             balance = int(u["balance"] if u else 0)
-            if balance < int(p["price"]):
-                text = f"❌ Số dư không đủ. Bạn có <b>{fmt_money(balance)}</b>, cần <b>{fmt_money(p['price'])}</b>."
-            elif not key:
-                text = "⏳ Gói này hiện chưa có key sẵn. Vui lòng liên hệ admin."
+            price = int(p["price"]); days = int(p["days"])
+            if balance < price:
+                text = f"❌ Số dư không đủ. Bạn có <b>{fmt_money(balance)}</b>, cần <b>{fmt_money(price)}</b>."
             else:
-                changed = c.execute("UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?", (int(p["price"]), uid, int(p["price"]))).rowcount
+                # Tự sinh key mới trong cùng transaction; không cần kho key tạo trước.
+                changed = c.execute("UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?", (price, uid, price)).rowcount
                 if changed != 1:
                     text = "⚠️ Giao dịch đã được xử lý hoặc số dư thay đổi. Vui lòng mở lại Mua gói."
                 else:
-                    exp = iso(now() + timedelta(days=int(p["days"])))
-                    locked = c.execute("UPDATE keys SET used_by=?,used_at=?,expires_at=? WHERE key=? AND used_by IS NULL", (uid, iso(now()), exp, key["key"])).rowcount
-                    if locked != 1:
-                        c.execute("UPDATE users SET balance=balance+? WHERE telegram_id=?", (int(p["price"]), uid))
-                        text = "⚠️ Key vừa được người khác nhận. Tiền đã được hoàn lại, vui lòng thử lại."
-                    else:
-                        text = f"✅ <b>MUA KEY THÀNH CÔNG</b>\n\n💎 Gói: <b>{html.escape(name)}</b>\n🔑 Key của bạn: <code>{key['key']}</code>\n⏳ Hạn dùng: <code>{exp}</code>\n💳 Số dư còn lại: <b>{fmt_money(balance-int(p['price']))}</b>"
+                    created = iso(now()); exp = iso(now() + timedelta(days=days))
+                    count = c.execute("SELECT COUNT(*) n FROM keys").fetchone()["n"] + 1
+                    seed = f"{BOT_TOKEN}:{uid}:{name}:{count}:{time.time_ns()}".encode()
+                    key_value = "TX-" + hashlib.sha256(seed).hexdigest()[:20].upper()
+                    c.execute("INSERT INTO keys(key,package_name,days,used_by,created_at,used_at,expires_at) VALUES(?,?,?,?,?,?,?)", (key_value, name, days, uid, created, created, exp))
+                    text = f"✅ <b>MUA KEY THÀNH CÔNG</b>\n\n💎 Gói: <b>{html.escape(name)}</b>\n🔑 Key mới của bạn: <code>{key_value}</code>\n⏳ Hạn dùng: <code>{exp}</code>\n💳 Số dư còn lại: <b>{fmt_money(balance-price)}</b>"
     k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🎮 Chơi ngay", callback_data="play"), types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
     if call: edit_page(call, text, k)
     else: bot.send_message(uid, text, reply_markup=k)
@@ -482,9 +480,14 @@ def play(cid, call=None):
 
 
 def analyze_message(message):
-    if not user_key(message.chat.id): bot.send_message(message.chat.id, "🔒 Key đã hết hạn hoặc chưa được kích hoạt."); return
+    if not user_key(message.chat.id):
+        bot.send_message(message.chat.id, "🔒 Key đã hết hạn hoặc chưa được kích hoạt.")
+        return
     out = analyzer.analyze(message.text)
-    if not out["ok"]: bot.send_message(message.chat.id, "❌ " + out["error"]); return
+    if not out["ok"]:
+        bot.send_message(message.chat.id, "❌ " + out["error"] + "\n\n🔁 Hãy gửi lại mã MD5/SHA hợp lệ.")
+        bot.register_next_step_handler_by_chat_id(message.chat.id, analyze_message)
+        return
     digest = out['hash'].upper()
     short = digest[:8] + "..." + digest[-8:]
     nums = [int(digest[i:i+2], 16) % 6 + 1 for i in (0, 2, 4)]
