@@ -291,8 +291,19 @@ def nav_keyboard(uid):
     return k
 
 
-def page_text():
-    return f"<b>✨ {html.escape(BOT_NAME)} ✨</b>\n\nChào mừng bạn! Chọn một chức năng bên dưới để bắt đầu."
+def page_text(uid):
+    with db() as c:
+        u = c.execute("SELECT * FROM users WHERE telegram_id=?", (uid,)).fetchone()
+    name = (u["username"] if u and u["username"] else (u["first_name"] if u and u["first_name"] else "bạn"))
+    balance = fmt_money(u["balance"] if u and "balance" in u.keys() else 0)
+    active = user_key(uid)
+    package = html.escape(active["package_name"]) if active else ""
+    expires = html.escape(active["expires_at"]) if active else ""
+    remaining = ""
+    if active:
+        try: remaining = str(max(0, (datetime.fromisoformat(active["expires_at"]) - now()).days)) + " ngày"
+        except Exception: remaining = ""
+    return f"👑 <b>Md5 Bot Auza</b>\n✨ <i>Hệ thống phân tích MD5 Tài/Xỉu cao cấp</i>\n\n👋 Xin chào, <b>{html.escape(name)}</b>\n🆔 ID: <code>{uid}</code>\n💰 Số dư: <b>{balance}</b>\n📦 Gói: <b>{package}</b>\n⏳ Hạn dùng: <code>{expires}</code>\n⌛ Còn lại: <b>{remaining}</b>\n\n⚠️ Không có gói miễn phí. Mua gói để phân tích MD5 Tài/Xỉu."
 
 
 def edit_page(call, text, markup):
@@ -304,7 +315,7 @@ def edit_page(call, text, markup):
 
 
 def welcome(chat_id):
-    bot.send_message(chat_id, page_text(), reply_markup=nav_keyboard(chat_id))
+    bot.send_message(chat_id, page_text(chat_id), reply_markup=nav_keyboard(chat_id))
 
 
 @bot.message_handler(commands=["start", "menu", "help"])
@@ -316,7 +327,7 @@ def start(message):
 def callbacks(call):
     uid, cid = call.from_user.id, call.message.chat.id
     try:
-        if call.data == "home": edit_page(call, page_text(), nav_keyboard(uid))
+        if call.data == "home": edit_page(call, page_text(uid), nav_keyboard(uid))
         elif call.data == "packages": show_packages(cid, call)
         elif call.data == "deposit": ask_deposit(cid, call)
         elif call.data == "play": play(cid, call)
@@ -332,7 +343,9 @@ def callbacks(call):
         elif call.data.startswith("reject:"): decide_deposit(uid, int(call.data.split(":")[1]), False)
         elif call.data == "admin_key": edit_page(call, "🔑 <b>Tạo key</b>\n\nDùng lệnh <code>/taokey Tên_gói</code> để tạo key.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
         elif call.data == "admin_stats": send_stats(cid, call)
-        elif call.data == "admin_broadcast": edit_page(call, "📢 <b>Thông báo toàn bộ</b>\n\nDùng lệnh <code>/thongbao nội dung</code>.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
+        elif call.data == "admin_broadcast":
+            edit_page(call, "📢 <b>THÔNG BÁO TOÀN BỘ</b>\n\nHãy nhập nội dung thông báo ở tin nhắn kế tiếp.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
+            bot.register_next_step_handler_by_chat_id(cid, broadcast_next_step)
         bot.answer_callback_query(call.id)
     except Exception:
         log.exception("callback error")
@@ -413,7 +426,18 @@ def analyze_message(message):
     if not user_key(message.chat.id): bot.send_message(message.chat.id, "🔒 Key đã hết hạn hoặc chưa được kích hoạt."); return
     out = analyzer.analyze(message.text)
     if not out["ok"]: bot.send_message(message.chat.id, "❌ " + out["error"]); return
-    bot.send_message(message.chat.id, f"🎯 <b>KẾT QUẢ PHÂN TÍCH</b>\n\n🔐 MD5/SHA: <code>{out['hash']}</code>\n🟢 Tài: <b>{out['tai']}%</b>\n🔴 Xỉu: <b>{out['xiu']}%</b>\n\n📌 Nên đánh: <b>{out['result']}</b>\n📊 Độ nghiêng: <b>{out['confidence']}%</b>")
+    digest = out['hash'].upper()
+    short = digest[:8] + "..." + digest[-8:]
+    nums = [int(digest[i:i+2], 16) % 6 + 1 for i in (0, 2, 4)]
+    total = sum(nums)
+    verdict = "🅣 TÀI" if out['result'] == "Tài" else "🅧 XỈU"
+    text = (f"🔮 <b>PHÂN TÍCH MD5 TÀI/XỈU</b>\n\n"
+            f"📦 Phiên bản: <b>Mới Nhất</b>\n"
+            f"📝 MD5 hiện tại: <code>{short}</code>\n\n"
+            f"🎲 Bộ số mô phỏng: <b>{nums[0]}-{nums[1]}-{nums[2]}</b> | Tổng: <b>{total}</b>\n"
+            f"📉 Kết luận: <b>{verdict}</b>\n"
+            f"🎯 Tài/Xỉu %: <b>T {out['tai']}% · X {out['xiu']}%</b>")
+    bot.send_message(message.chat.id, text)
 
 
 def show_account(cid, call=None):
@@ -472,18 +496,29 @@ def create_key_cmd(message):
     with db() as c: c.execute("INSERT INTO keys(key,package_name,days,created_at) VALUES(?,?,?,?)", (key, name, p["days"], iso(now())))
     bot.send_message(message.chat.id, f"Đã tạo key cho <b>{html.escape(name)}</b>:\n<code>{key}</code>")
 
+def broadcast_text(admin_chat_id, text):
+    with db() as c: users = [r["telegram_id"] for r in c.execute("SELECT telegram_id FROM users")]
+    sent = 0
+    for target in users:
+        try: bot.send_message(target, "📢 <b>Thông báo từ admin</b>\n\n" + html.escape(text)); sent += 1
+        except Exception: pass
+    with db() as c: c.execute("INSERT INTO broadcasts(text,sent_at) VALUES(?,?)", (text, iso(now())))
+    bot.send_message(admin_chat_id, f"✅ Đã gửi thông báo tới {sent}/{len(users)} người dùng.")
+
+
+def broadcast_next_step(message):
+    if is_admin(message.from_user.id) and (message.text or "").strip():
+        broadcast_text(message.chat.id, message.text.strip())
+
+
 @bot.message_handler(commands=["thongbao"])
 def broadcast_cmd(message):
     if not is_admin(message.from_user.id): return
     text = (message.text or "").partition(" ")[2].strip()
-    if not text: bot.send_message(message.chat.id, "Dùng /thongbao nội dung"); return
-    with db() as c: users = [r["telegram_id"] for r in c.execute("SELECT telegram_id FROM users")]
-    sent = 0
-    for uid in users:
-        try: bot.send_message(uid, "<b>Thông báo từ admin</b>\n\n" + html.escape(text)); sent += 1
-        except Exception: pass
-    with db() as c: c.execute("INSERT INTO broadcasts(text,sent_at) VALUES(?,?)", (text, iso(now())))
-    bot.send_message(message.chat.id, f"Đã gửi {sent}/{len(users)} người dùng.")
+    if text: broadcast_text(message.chat.id, text)
+    else:
+        bot.send_message(message.chat.id, "📢 Hãy nhập nội dung thông báo ở tin nhắn kế tiếp.")
+        bot.register_next_step_handler_by_chat_id(message.chat.id, broadcast_next_step)
 
 
 def send_stats(cid, call=None):
@@ -509,10 +544,12 @@ def notify_admin_deposit(did):
         except Exception: pass
 
 
-def confirm_deposit(uid, did):
+def confirm_deposit(uid, did, call=None):
     with db() as c: r = c.execute("SELECT * FROM deposits WHERE id=? AND telegram_id=?", (did, uid)).fetchone()
-    if not r or r["status"] != "pending": bot.send_message(uid, "Đơn không tồn tại hoặc đã xử lý."); return
-    bot.send_message(uid, "Đã gửi yêu cầu xác nhận tới admin. Vui lòng chờ duyệt."); notify_admin_deposit(did)
+    if not r or r["status"] != "pending":
+        bot.send_message(uid, "❌ Đơn không tồn tại hoặc đã xử lý."); return
+    bot.send_message(uid, f"✅ Đã gửi xác nhận đơn nạp <b>#{did}</b> tới admin. Vui lòng chờ duyệt.")
+    notify_admin_deposit(did)
 
 
 def decide_deposit(uid, did, approved):
