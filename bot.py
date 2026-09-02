@@ -25,22 +25,6 @@ PORT = int(os.getenv("PORT", "10000"))
 DB_PATH = os.getenv("DB_PATH", "bot.sqlite3")
 BOT_NAME = os.getenv("BOT_NAME", "MD5 Tài Xỉu Pro")
 
-# Custom emoji Premium là tùy chọn. Đặt JSON dạng {"brand":"123...", "play":"123..."}
-# nếu bot đủ điều kiện dùng custom emoji; nếu không, bot tự dùng Unicode fallback.
-try:
-    CUSTOM_EMOJI_IDS = json.loads(os.getenv("CUSTOM_EMOJI_IDS", "{}"))
-    if not isinstance(CUSTOM_EMOJI_IDS, dict):
-        CUSTOM_EMOJI_IDS = {}
-except Exception:
-    CUSTOM_EMOJI_IDS = {}
-
-
-def tg_icon(name, fallback):
-    emoji_id = str(CUSTOM_EMOJI_IDS.get(name, "")).strip()
-    if emoji_id.isdigit():
-        return f'<tg-emoji emoji-id="{html.escape(emoji_id)}"></tg-emoji>'
-    return fallback
-
 # Không đặt thông tin ngân hàng thật trong mã nguồn. Có thể sửa tại /admin.
 DEFAULT_BANK = {
     "bank_code": os.getenv("BANK_CODE", "MBBank"),
@@ -443,10 +427,10 @@ analyzer = HashAnalyzer()
 # ============================================================
 def nav_keyboard(uid):
     k = types.InlineKeyboardMarkup(row_width=2)
-    k.add(types.InlineKeyboardButton("🔵 CHƠI NGAY", callback_data="play"), types.InlineKeyboardButton("🟣 MUA GÓI", callback_data="packages"))
-    k.add(types.InlineKeyboardButton("🟢 NẠP TIỀN", callback_data="deposit"), types.InlineKeyboardButton("🔷 TÀI KHOẢN", callback_data="account"))
-    k.add(types.InlineKeyboardButton("🟡 LIÊN HỆ", callback_data="contact"), types.InlineKeyboardButton("🟠 GIFTCODE", callback_data="giftcode"))
-    if is_admin(uid): k.add(types.InlineKeyboardButton("🔧 QUẢN TRỊ", callback_data="admin_menu"))
+    k.add(types.InlineKeyboardButton("🎮 Chơi ngay", callback_data="play"), types.InlineKeyboardButton("💎 Mua gói", callback_data="packages"))
+    k.add(types.InlineKeyboardButton("💳 Nạp tiền", callback_data="deposit"), types.InlineKeyboardButton("👤 Tài khoản", callback_data="account"))
+    k.add(types.InlineKeyboardButton("📞 Liên hệ", callback_data="contact"), types.InlineKeyboardButton("🎁 Giftcode", callback_data="giftcode"))
+    if is_admin(uid): k.add(types.InlineKeyboardButton("🛠 Quản trị", callback_data="admin_menu"))
     return k
 
 
@@ -462,7 +446,7 @@ def page_text(uid):
     if active:
         try: remaining = str(max(0, (datetime.fromisoformat(active["expires_at"]) - now()).days)) + " ngày"
         except Exception: remaining = ""
-    return f"{tg_icon('brand', '👑')} <b>Md5 Bot Auza</b>\n{tg_icon('sparkles', '✨')} <i>Hệ thống phân tích MD5 Tài/Xỉu cao cấp</i>\n\n👋 Xin chào, <b>{html.escape(name)}</b>\n🆔 ID: <code>{uid}</code>\n💰 Số dư: <b>{balance}</b>\n📦 Gói: <b>{package}</b>\n⏳ Hạn dùng: <code>{expires}</code>\n⌛ Còn lại: <b>{remaining}</b>\n\n⚠️ Không có gói miễn phí. Mua gói để phân tích MD5 Tài/Xỉu."
+    return f"👑 <b>Md5 Bot Auza</b>\n✨ <i>Hệ thống phân tích MD5 Tài/Xỉu cao cấp</i>\n\n👋 Xin chào, <b>{html.escape(name)}</b>\n🆔 ID: <code>{uid}</code>\n💰 Số dư: <b>{balance}</b>\n📦 Gói: <b>{package}</b>\n⏳ Hạn dùng: <code>{expires}</code>\n⌛ Còn lại: <b>{remaining}</b>\n\n⚠️ Không có gói miễn phí. Mua gói để phân tích MD5 Tài/Xỉu."
 
 
 def edit_page(call, text, markup):
@@ -494,14 +478,14 @@ def callbacks(call):
         elif call.data == "deposit": ask_deposit(cid, call)
         elif call.data == "play": play(cid, call)
         elif call.data == "enter_key":
-            edit_page(call, "🔐 <b>Nhập key</b>\n\nHãy gửi key của bạn trong tin nhắn tiếp theo.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("◀️ QUAY LẠI", callback_data="home")))
+            edit_page(call, "🔐 <b>Nhập key</b>\n\nHãy gửi key của bạn trong tin nhắn tiếp theo.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Quay lại", callback_data="home")))
             bot.register_next_step_handler_by_chat_id(cid, activate_key)
         elif call.data.startswith("confirm_deposit:"):
             confirm_deposit(uid, int(call.data.split(":", 1)[1]), call)
         elif call.data == "account": show_account(cid, call)
         elif call.data == "contact": show_contact(cid, call)
         elif call.data == "giftcode":
-            edit_page(call, "🎁 <b>NHẬP GIFTCODE</b>\n\nGửi mã giftcode ở tin nhắn kế tiếp.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 TRANG CHỦ", callback_data="home")))
+            edit_page(call, "🎁 <b>NHẬP GIFTCODE</b>\n\nGửi mã giftcode ở tin nhắn kế tiếp.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home")))
             bot.register_next_step_handler_by_chat_id(cid, redeem_giftcode)
         elif call.data.startswith("confirm_buy:"): purchase_package(uid, call.data.split(":", 1)[1], call)
         elif call.data == "admin_menu": admin_menu(cid, call) if is_admin(uid) else None
@@ -510,10 +494,10 @@ def callbacks(call):
         elif call.data.startswith("approve_confirm:"): decide_deposit(uid, int(call.data.split(":")[1]), True)
         elif call.data.startswith("reject:"): request_reject(uid, int(call.data.split(":")[1]), call)
         elif call.data.startswith("reject_confirm:"): decide_deposit(uid, int(call.data.split(":")[1]), False)
-        elif call.data == "admin_key": edit_page(call, "🔑 <b>Tạo key</b>\n\nDùng lệnh <code>/taokey Tên_gói</code> để tạo key.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("◀️ ADMIN", callback_data="admin_menu")))
+        elif call.data == "admin_key": edit_page(call, "🔑 <b>Tạo key</b>\n\nDùng lệnh <code>/taokey Tên_gói</code> để tạo key.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
         elif call.data == "admin_stats": send_stats(cid, call)
         elif call.data == "admin_broadcast":
-            edit_page(call, "📢 <b>THÔNG BÁO TOÀN BỘ</b>\n\nHãy nhập nội dung thông báo ở tin nhắn kế tiếp.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("◀️ ADMIN", callback_data="admin_menu")))
+            edit_page(call, "📢 <b>THÔNG BÁO TOÀN BỘ</b>\n\nHãy nhập nội dung thông báo ở tin nhắn kế tiếp.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
             bot.register_next_step_handler_by_chat_id(cid, broadcast_next_step)
         bot.answer_callback_query(call.id)
     except Exception:
@@ -527,15 +511,15 @@ def show_packages(cid, call=None):
     k = types.InlineKeyboardMarkup(row_width=1)
     for name, p in packages.items():
         lines.append(f"🔹 <b>{html.escape(name)}</b>  •  {fmt_money(p['price'])}  •  {p['days']} ngày")
-        k.add(types.InlineKeyboardButton(f"🛒 MUA {name}", callback_data="buy:" + name[:50]))
-    k.add(types.InlineKeyboardButton("🟢 NẠP TIỀN", callback_data="deposit"), types.InlineKeyboardButton("🏠 TRANG CHỦ", callback_data="home"))
+        k.add(types.InlineKeyboardButton(f"🛒 Mua {name}", callback_data="buy:" + name[:50]))
+    k.add(types.InlineKeyboardButton("💳 Nạp tiền", callback_data="deposit"), types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
     if call: edit_page(call, "\n".join(lines), k)
     else: bot.send_message(cid, "\n".join(lines), reply_markup=k)
 
 
 def ask_deposit(cid, call=None):
     text = "💳 <b>NẠP TIỀN</b>\n\nNhập số tiền muốn nạp, chỉ nhập số.\nVí dụ: <code>50000</code>"
-    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("◀️ QUAY LẠI", callback_data="home"))
+    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Quay lại", callback_data="home"))
     if call: edit_page(call, text, k)
     else: bot.send_message(cid, text, reply_markup=k)
     bot.register_next_step_handler_by_chat_id(cid, create_deposit)
@@ -566,7 +550,7 @@ def create_deposit(message):
         did = cur.lastrowid
     qr = f"https://img.vietqr.io/image/{bank['bank_code']}-{bank['account_no']}-compact2.png?amount={amount}&addInfo={content}&accountName={requests.utils.quote(bank['account_name'])}"
     caption = f"💳 <b>ĐƠN NẠP #{did}</b>\n\n🏦 Ngân hàng: <code>{html.escape(bank['bank_code'])}</code>\n🔢 STK: <code>{html.escape(bank['account_no'])}</code>\n👤 Tên: <code>{html.escape(bank['account_name'])}</code>\n💰 Số tiền: <b>{fmt_money(amount)}</b>\n📝 Nội dung: <code>{content}</code>\n\nSau khi chuyển khoản, hãy bấm nút bên dưới."
-    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("✅ ĐÃ NẠP TIỀN", callback_data=f"confirm_deposit:{did}"), types.InlineKeyboardButton("🏠 TRANG CHỦ", callback_data="home"))
+    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("✅ Tôi đã nạp tiền", callback_data=f"confirm_deposit:{did}"), types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
     bot.send_photo(uid, qr, caption=caption, reply_markup=k)
 
 
@@ -575,12 +559,12 @@ def buy_package(cid, name, call=None):
     p = packages.get(name)
     if not p:
         text = "❌ Gói này không còn tồn tại."
-        k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("◀️ GÓI KEY", callback_data="packages"))
+        k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Gói key", callback_data="packages"))
     else:
         with db() as c: u = c.execute("SELECT COALESCE(balance,0) balance FROM users WHERE telegram_id=?", (cid,)).fetchone()
         balance = int(u["balance"] if u else 0)
         text = f"💎 <b>{html.escape(name)}</b>\n\n💰 Giá: <b>{fmt_money(p['price'])}</b>\n⏱ Thời hạn: <b>{p['days']} ngày</b>\n💳 Số dư của bạn: <b>{fmt_money(balance)}</b>\n\nBấm xác nhận để hệ thống trừ tiền và giao key tự động."
-        k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("✅ XÁC NHẬN MUA KEY", callback_data="confirm_buy:" + name[:50]), types.InlineKeyboardButton("🟢 NẠP TIỀN", callback_data="deposit"), types.InlineKeyboardButton("◀️ GÓI KEY", callback_data="packages"))
+        k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("✅ Xác nhận mua key", callback_data="confirm_buy:" + name[:50]), types.InlineKeyboardButton("💳 Nạp tiền", callback_data="deposit"), types.InlineKeyboardButton("↩️ Gói key", callback_data="packages"))
     if call: edit_page(call, text, k)
     else: bot.send_message(cid, text, reply_markup=k)
 
@@ -609,7 +593,7 @@ def purchase_package(uid, name, call=None):
                     key_value = "TX-" + hashlib.sha256(seed).hexdigest()[:20].upper()
                     c.execute("INSERT INTO keys(key,package_name,days,used_by,created_at,used_at,expires_at) VALUES(?,?,?,?,?,?,?)", (key_value, name, days, uid, created, created, exp))
                     text = f"✅ <b>MUA KEY THÀNH CÔNG</b>\n\n💎 Gói: <b>{html.escape(name)}</b>\n🔑 Key mới của bạn: <code>{key_value}</code>\n⏳ Hạn dùng: <code>{exp}</code>\n💳 Số dư còn lại: <b>{fmt_money(balance-price)}</b>"
-    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔵 CHƠI NGAY", callback_data="play"), types.InlineKeyboardButton("🏠 TRANG CHỦ", callback_data="home"))
+    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🎮 Chơi ngay", callback_data="play"), types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
     if call: edit_page(call, text, k)
     else: bot.send_message(uid, text, reply_markup=k)
 
@@ -617,7 +601,7 @@ def purchase_package(uid, name, call=None):
 def show_contact(cid, call=None):
     bank = get_setting("bank", DEFAULT_BANK); link = bank.get("contact_link", "https://t.me/")
     text = f"📞 <b>LIÊN HỆ HỖ TRỢ</b>\n\nNếu cần hỗ trợ nạp tiền, mua key hoặc đối soát đơn, hãy liên hệ admin."
-    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("💬 MỞ LIÊN HỆ", url=link), types.InlineKeyboardButton("🏠 TRANG CHỦ", callback_data="home"))
+    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("💬 Mở liên hệ", url=link), types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
     if call: edit_page(call, text, k)
     else: bot.send_message(cid, text, reply_markup=k)
 
@@ -626,10 +610,10 @@ def play(cid, call=None):
     row = user_key(cid)
     if not row:
         text = "🔒 <b>KHU VỰC CHƠI</b>\n\nBạn chưa có key còn hạn. Hãy nhập key hoặc mua gói để tiếp tục."
-        k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔐 NHẬP KEY", callback_data="enter_key"), types.InlineKeyboardButton("🟣 MUA GÓI", callback_data="packages"))
+        k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔐 Nhập key", callback_data="enter_key"), types.InlineKeyboardButton("💎 Mua gói", callback_data="packages"))
     else:
         text = f"🎮 <b>SẴN SÀNG PHÂN TÍCH</b>\n\nKey còn hạn đến: <code>{row['expires_at']}</code>\n\nGửi mã MD5 32 ký tự hoặc SHA-256 64 ký tự."
-        k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 TRANG CHỦ", callback_data="home"))
+        k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
     if call: edit_page(call, text, k)
     else: bot.send_message(cid, text, reply_markup=k)
     if row: bot.register_next_step_handler_by_chat_id(cid, analyze_message)
@@ -668,7 +652,7 @@ def show_account(cid, call=None):
     row = user_key(cid)
     if row: text = f"👤 <b>TÀI KHOẢN</b>\n\n🔑 Gói: <b>{html.escape(row['package_name'])}</b>\n⏳ Hết hạn: <code>{row['expires_at']}</code>"
     else: text = "👤 <b>TÀI KHOẢN</b>\n\nBạn chưa có key còn hạn."
-    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🟣 MUA GÓI", callback_data="packages"), types.InlineKeyboardButton("🏠 TRANG CHỦ", callback_data="home"))
+    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("💎 Mua gói", callback_data="packages"), types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
     if call: edit_page(call, text, k)
     else: bot.send_message(cid, text, reply_markup=k)
 
@@ -721,9 +705,9 @@ def redeem_giftcode(message):
 # ============================================================
 def admin_menu(cid, call=None):
     k = types.InlineKeyboardMarkup(row_width=2)
-    k.add(types.InlineKeyboardButton("🔑 TẠO KEY", callback_data="admin_key"), types.InlineKeyboardButton("📊 THỐNG KÊ", callback_data="admin_stats"))
-    k.add(types.InlineKeyboardButton("📣 THÔNG BÁO", callback_data="admin_broadcast"))
-    k.add(types.InlineKeyboardButton("🏠 TRANG CHỦ", callback_data="home"))
+    k.add(types.InlineKeyboardButton("🔑 Tạo key", callback_data="admin_key"), types.InlineKeyboardButton("📊 Thống kê", callback_data="admin_stats"))
+    k.add(types.InlineKeyboardButton("📢 Thông báo toàn bộ", callback_data="admin_broadcast"))
+    k.add(types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
     if call: edit_page(call, "🛠 <b>BẢNG QUẢN TRỊ</b>\n\nChọn chức năng quản lý bên dưới.", k)
     else: bot.send_message(cid, "🛠 <b>BẢNG QUẢN TRỊ</b>", reply_markup=k)
 
@@ -794,7 +778,7 @@ def send_stats(cid, call=None):
         d = c.execute("SELECT COUNT(*) n FROM deposits WHERE status='pending'").fetchone()["n"]
         total = c.execute("SELECT COALESCE(SUM(amount),0) s FROM deposits WHERE status='approved'").fetchone()["s"]
     text = f"📊 <b>THỐNG KÊ HỆ THỐNG</b>\n\n👥 Người dùng: <b>{u}</b>\n🔑 Key chưa dùng: <b>{k}</b>\n⏳ Đơn chờ duyệt: <b>{d}</b>\n💰 Tổng đã duyệt: <b>{fmt_money(total)}</b>"
-    kbd = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("◀️ QUẢN TRỊ", callback_data="admin_menu"))
+    kbd = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Quản trị", callback_data="admin_menu"))
     if call: edit_page(call, text, kbd)
     else: bot.send_message(cid, text, reply_markup=kbd)
 
@@ -803,7 +787,7 @@ def notify_admin_deposit(did):
     with db() as c:
         r = c.execute("SELECT * FROM deposits WHERE id=?", (did,)).fetchone()
     if not r: return
-    k = types.InlineKeyboardMarkup(); k.add(types.InlineKeyboardButton("🟢 DUYỆT ĐƠN", callback_data=f"approve:{did}"), types.InlineKeyboardButton("🔴 TỪ CHỐI", callback_data=f"reject:{did}"))
+    k = types.InlineKeyboardMarkup(); k.add(types.InlineKeyboardButton("✅ Duyệt đơn", callback_data=f"approve:{did}"), types.InlineKeyboardButton("❌ Từ chối", callback_data=f"reject:{did}"))
     text = f"🔔 <b>YÊU CẦU XÁC NHẬN ĐƠN NẠP #{did}</b>\n\n👤 User: <code>{r['telegram_id']}</code>\n💰 Số tiền: <b>{fmt_money(r['amount'])}</b>\n📝 Nội dung: <code>{r['content']}</code>\n\nVui lòng kiểm tra giao dịch thực tế trước khi duyệt."
     for aid in ADMIN_IDS:
         try: bot.send_message(aid, text, reply_markup=k)
@@ -814,7 +798,7 @@ def request_approve(admin_uid, did, call=None):
     if not is_admin(admin_uid): return
     with db() as c: r = c.execute("SELECT * FROM deposits WHERE id=? AND status='pending'", (did,)).fetchone()
     if not r: return
-    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🟢 XÁC NHẬN DUYỆT & CỘNG TIỀN", callback_data=f"approve_confirm:{did}"), types.InlineKeyboardButton("⚪ HỦY", callback_data="admin_menu"))
+    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("✅ XÁC NHẬN DUYỆT & CỘNG TIỀN", callback_data=f"approve_confirm:{did}"), types.InlineKeyboardButton("↩️ Hủy", callback_data="admin_menu"))
     edit_page(call, f"⚠️ <b>XÁC NHẬN DUYỆT ĐƠN #{did}</b>\n\n💰 Số tiền: <b>{fmt_money(r['amount'])}</b>\n👤 User: <code>{r['telegram_id']}</code>\n\nSau khi xác nhận, hệ thống sẽ cộng tiền vào số dư user. Hãy chắc chắn đã kiểm tra giao dịch.", k)
 
 
@@ -822,7 +806,7 @@ def request_reject(admin_uid, did, call=None):
     if not is_admin(admin_uid): return
     with db() as c: r = c.execute("SELECT * FROM deposits WHERE id=? AND status='pending'", (did,)).fetchone()
     if not r: return
-    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔴 XÁC NHẬN TỪ CHỐI", callback_data=f"reject_confirm:{did}"), types.InlineKeyboardButton("⚪ HỦY", callback_data="admin_menu"))
+    k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("❌ XÁC NHẬN TỪ CHỐI", callback_data=f"reject_confirm:{did}"), types.InlineKeyboardButton("↩️ Hủy", callback_data="admin_menu"))
     edit_page(call, f"⚠️ <b>XÁC NHẬN TỪ CHỐI ĐƠN #{did}</b>\n\nUser: <code>{r['telegram_id']}</code>\nSố tiền: <b>{fmt_money(r['amount'])}</b>", k)
 
 
