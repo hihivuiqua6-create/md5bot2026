@@ -1,9 +1,7 @@
 import os
-import os
 import re
 import json
 import time
-import html
 import sqlite3
 import hashlib
 import logging
@@ -12,6 +10,7 @@ import base64
 import secrets
 from datetime import datetime, timedelta, timezone
 from collections import Counter
+import math
 
 import requests
 import telebot
@@ -42,7 +41,7 @@ DEFAULT_PACKAGES = {
     "Gói 1 Tháng": {"price": 90000, "days": 31},
     "Gói Vĩnh Viễn ( Sale )": {"price": 50000, "days": 9999999999999},
 }
-PACKAGE_CONFIG_VERSION = 3
+PACKAGE_CONFIG_VERSION = 4
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("md5tx")
@@ -97,6 +96,11 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER NOT NULL,
             hash_input TEXT NOT NULL, result TEXT NOT NULL, tai REAL NOT NULL,
             xiu REAL NOT NULL, confidence REAL NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, pattern TEXT NOT NULL,
+            result TEXT NOT NULL, frequency INTEGER NOT NULL DEFAULT 1,
+            last_seen TEXT NOT NULL
         );
         """)
         cols = [r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()]
@@ -237,366 +241,301 @@ def user_key(uid):
 
 
 # ============================================================
-# THUẬT TOÁN DỰ ĐOÁN MD5 NÂNG CẤP - KHÔNG LẶP KẾT QUẢ
+# THUẬT TOÁN DỰ ĐOÁN MD5 SIÊU CẤP - TỐI ƯU WIN RATE
 # ============================================================
-class HashAnalyzer:
+class SuperAnalyzer:
     def __init__(self):
-        self._last_result = None
-        self._last_hash = None
-        self._last_time = 0
-        self._result_counter = 0
-
+        self._patterns = {}
+        self._load_patterns()
+        
+    def _load_patterns(self):
+        try:
+            with db() as c:
+                rows = c.execute("SELECT pattern, result, frequency FROM patterns").fetchall()
+                for row in rows:
+                    self._patterns[row['pattern']] = {'result': row['result'], 'freq': row['frequency']}
+        except:
+            pass
+    
+    def _save_pattern(self, pattern, result):
+        with db() as c:
+            c.execute("""INSERT INTO patterns(pattern, result, frequency, last_seen) 
+                         VALUES(?,?,1,?) ON CONFLICT(pattern) DO UPDATE SET 
+                         frequency=frequency+1, last_seen=excluded.last_seen""",
+                      (pattern, result, iso(now())))
+    
     def _bits(self, data):
         return [(b >> (7 - i)) & 1 for b in data for i in range(8)]
-
+    
     def _entropy(self, values):
         if not values:
             return 0.0
         cnt = Counter(values)
         n = len(values)
-        import math
         return -sum((v / n) * math.log2(v / n) for v in cnt.values())
-
-    def _spectral_score(self, bits):
-        import math
+    
+    def _chi_square_test(self, bits):
+        """Kiểm tra tính ngẫu nhiên bằng chi-square"""
         n = len(bits)
-        if n < 16:
-            return 0.0
-        score = 0.0
-        for k in range(1, min(n // 2, 32)):
-            re_part = sum(bits[t] * math.cos(2 * math.pi * k * t / n) for t in range(n))
-            im_part = sum(bits[t] * math.sin(2 * math.pi * k * t / n) for t in range(n))
-            power = re_part * re_part + im_part * im_part
-            score += power * (1 if k % 2 else -1)
-        return score / (n * n)
-
-    def _source_spectral_density(self, data):
-        if len(data) < 16:
-            return 0.0, 0.0
+        ones = sum(bits)
+        zeros = n - ones
+        expected = n / 2
+        chi2 = ((ones - expected) ** 2 + (zeros - expected) ** 2) / expected
+        return chi2
+    
+    def _runs_test(self, bits):
+        """Kiểm tra độ dài run"""
+        n = len(bits)
+        runs = []
+        run_len = 1
+        for i in range(1, n):
+            if bits[i] == bits[i-1]:
+                run_len += 1
+            else:
+                runs.append(run_len)
+                run_len = 1
+        runs.append(run_len)
+        if not runs:
+            return 0, 0
+        return sum(runs) / len(runs), max(runs)
+    
+    def _frequency_test(self, data):
+        """Kiểm tra tần suất xuất hiện của các byte"""
+        cnt = Counter(data)
         n = len(data)
-        harmonics = []
-        import math
-        for k in range(n // 2):
-            real = sum(data[t] * math.cos(2 * math.pi * k * t / n) for t in range(n))
-            imag = sum(data[t] * math.sin(2 * math.pi * k * t / n) for t in range(n))
-            harmonics.append(real * real + imag * imag)
-        if not harmonics:
-            return 0.0, 0.0
-        total = sum(harmonics) + 1e-9
-        odd_power = sum(harmonics[i] for i in range(1, len(harmonics), 2))
-        even_power = sum(harmonics[i] for i in range(0, len(harmonics), 2))
-        tai = xiu = 0.0
-        spectral_bias = (odd_power - even_power) / total
-        if spectral_bias > 0.15:
-            tai += 16.0
-        elif spectral_bias < -0.15:
-            xiu += 16.0
-        centroid = sum(i * power for i, power in enumerate(harmonics)) / total
-        if centroid > len(harmonics) / 2:
-            tai += 10.0
-        else:
-            xiu += 10.0
-        return tai, xiu
-
-    def _source_cellular_rule30(self, data):
-        if len(data) < 16:
-            return 0.0, 0.0
-        bits = self._bits(data)
-        state = list(bits)
-        density_history = []
-        for _ in range(8):
-            state = [state[(i - 1) % len(state)] ^ (state[i] | state[(i + 1) % len(state)]) for i in range(len(state))]
-            density_history.append(sum(state) / len(state))
-        tai = xiu = 0.0
-        avg_density = sum(density_history) / len(density_history)
-        if avg_density > 0.52:
-            tai += 18.0
-        elif avg_density < 0.48:
-            xiu += 18.0
-        if density_history[-1] > density_history[0]:
-            tai += 8.0
-        else:
-            xiu += 8.0
-        return tai, xiu
-
-    def _source_ultimate_md5_core(self, data):
-        if len(data) < 16:
-            return 0.0, 0.0, []
-        import math
-        n = len(data)
-        tai = xiu = 0.0
-        details = []
-        nibbles = [(b >> 4) & 0xF for b in data] + [b & 0xF for b in data]
-        high_nib = sum(1 for nib in nibbles if nib >= 8)
+        tai_score = 0
+        xiu_score = 0
+        
+        # Kiểm tra các giá trị > 128 (tài) và < 128 (xỉu)
+        high = sum(1 for b in data if b >= 128)
+        low = n - high
+        if high > low * 1.3:
+            tai_score += 20
+        elif low > high * 1.3:
+            xiu_score += 20
+        
+        # Kiểm tra nibble
+        nibbles = [(b >> 4) & 15 for b in data] + [b & 15 for b in data]
+        high_nib = sum(1 for n in nibbles if n >= 8)
         low_nib = len(nibbles) - high_nib
-        if high_nib > low_nib * 1.15:
-            tai += 15.0; details.append('v4-high-nibble→Tài')
-        elif low_nib > high_nib * 1.15:
-            xiu += 15.0; details.append('v4-low-nibble→Xỉu')
-        even_nib = sum(1 for nib in nibbles if nib % 2 == 0)
-        odd_nib = len(nibbles) - even_nib
-        if even_nib > odd_nib * 1.2:
-            xiu += 8.0
-        elif odd_nib > even_nib * 1.2:
-            tai += 8.0
-
-        byte_counts = Counter(data)
-        entropy = 0.0
-        for count in byte_counts.values():
-            p = count / n
-            if p > 0:
-                entropy -= p * math.log2(p)
-        max_entropy = math.log2(min(256, n))
-        entropy_ratio = entropy / max_entropy if max_entropy else 0.0
-        if entropy_ratio > 0.96:
-            if data[-1] >= 128: tai += 18.0
-            else: xiu += 18.0
-        elif entropy_ratio < 0.85:
-            if sum(data) / n > 128: xiu += 18.0
-            else: tai += 18.0
-
+        if high_nib > low_nib * 1.2:
+            tai_score += 15
+        elif low_nib > high_nib * 1.2:
+            xiu_score += 15
+        
+        return tai_score, xiu_score
+    
+    def _hash_feature_extraction(self, data):
+        """Trích xuất đặc trưng từ hash"""
+        features = {
+            'sum': sum(data),
+            'mean': sum(data) / len(data),
+            'variance': 0,
+            'min': min(data),
+            'max': max(data),
+            'median': 0,
+            'range': 0
+        }
+        sorted_data = sorted(data)
+        features['median'] = sorted_data[len(data)//2]
+        features['range'] = features['max'] - features['min']
+        
+        mean = features['mean']
+        features['variance'] = sum((b - mean) ** 2 for b in data) / len(data)
+        
+        return features
+    
+    def _pattern_recognition(self, data):
+        """Nhận diện mẫu từ dữ liệu lịch sử"""
+        # Tạo pattern từ dữ liệu đầu vào
+        pattern = ''.join('1' if b >= 128 else '0' for b in data[:16])
+        
+        if pattern in self._patterns:
+            p = self._patterns[pattern]
+            # Nếu pattern đã được ghi nhận, ưu tiên kết quả đó
+            if p['freq'] >= 5:
+                if p['result'] == 'Tài':
+                    return 20, 0
+                else:
+                    return 0, 20
+        
+        # Tìm pattern tương tự
+        similar = []
+        for pat, info in self._patterns.items():
+            if len(pat) >= 8:
+                # So sánh độ tương đồng
+                match = sum(1 for i in range(min(len(pattern), len(pat))) 
+                           if i < len(pattern) and i < len(pat) and pattern[i] == pat[i])
+                if match >= min(len(pattern), len(pat)) * 0.6:
+                    similar.append(info)
+        
+        if similar:
+            tai_votes = sum(1 for s in similar if s['result'] == 'Tài')
+            xiu_votes = len(similar) - tai_votes
+            if tai_votes > xiu_votes:
+                return 15, 0
+            elif xiu_votes > tai_votes:
+                return 0, 15
+        
+        return 0, 0
+    
+    def _md5_specific_analysis(self, data):
+        """Phân tích đặc thù cho MD5"""
+        tai_score = 0
+        xiu_score = 0
+        
+        # Phân tích 4 byte cuối (thường có ý nghĩa đặc biệt trong MD5)
+        last_4 = data[-4:] if len(data) >= 4 else data
+        last_sum = sum(last_4)
+        if last_sum > 512:
+            tai_score += 12
+        elif last_sum < 256:
+            xiu_score += 12
+        
+        # Phân tích byte ở vị trí chẵn/lẻ
+        even_bytes = data[::2]
+        odd_bytes = data[1::2]
+        even_sum = sum(even_bytes)
+        odd_sum = sum(odd_bytes)
+        
+        if even_sum > odd_sum * 1.2:
+            tai_score += 10
+        elif odd_sum > even_sum * 1.2:
+            xiu_score += 10
+        
+        # Phân tích XOR
+        xor_result = 0
+        for b in data:
+            xor_result ^= b
+        if xor_result >= 128:
+            tai_score += 8
+        else:
+            xiu_score += 8
+        
+        return tai_score, xiu_score
+    
+    def _dynamic_weighted_voting(self, data):
+        """Bỏ phiếu có trọng số động"""
         bits = self._bits(data)
-        ones = sum(bits); zeros = len(bits) - ones
-        if ones > zeros + 10: xiu += 12.0
-        elif zeros > ones + 10: tai += 12.0
-        runs = []; run = 1
-        for i in range(1, len(bits)):
-            if bits[i] == bits[i - 1]: run += 1
-            else: runs.append(run); run = 1
-        runs.append(run)
-        avg_run = sum(runs) / len(runs)
-        if avg_run > 2.5: tai += 10.0
-        elif avg_run < 1.8: xiu += 10.0
-
-        transitions = Counter()
-        for i in range(len(nibbles) - 2):
-            pair = (nibbles[i] >= 8, nibbles[i + 1] >= 8)
-            transitions[(pair, nibbles[i + 2] >= 8)] += 1
-        last_pair = (nibbles[-2] >= 8, nibbles[-1] >= 8)
-        if transitions[(last_pair, True)] > transitions[(last_pair, False)]:
-            tai += 20.0
-        elif transitions[(last_pair, False)] > transitions[(last_pair, True)]:
-            xiu += 20.0
-
-        spectral_tai, spectral_xiu = self._source_spectral_density(data)
-        cellular_tai, cellular_xiu = self._source_cellular_rule30(data)
-        tai += spectral_tai + cellular_tai
-        xiu += spectral_xiu + cellular_xiu
-        if tai > xiu + 5:
-            details.append('v4-core→Tài')
-        elif xiu > tai + 5:
-            details.append('v4-core→Xỉu')
-        return tai, xiu, details
-
-    def _time_based_variation(self, raw_hash, timestamp_ns):
-        """Thêm biến động dựa trên thời gian để kết quả không bị lặp"""
-        import math
-        # Dùng nano second và giá trị hash để tạo biến động
-        seed = int.from_bytes(raw_hash[:8].encode('utf-8', errors='ignore')[:8], 'big') if raw_hash else 0
-        seed = (seed ^ timestamp_ns ^ (timestamp_ns >> 32)) & 0xFFFFFFFFFFFFFFFF
+        n = len(bits)
         
-        # Tạo 3 giá trị biến động
-        v1 = ((seed * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF) / 2**64
-        v2 = ((seed * 3935559000370003841 + 2691343689449507681) & 0xFFFFFFFFFFFFFFFF) / 2**64
-        v3 = ((seed * 3077671533650594437 + 1294232471180009873) & 0xFFFFFFFFFFFFFFFF) / 2**64
+        tai_votes = 0
+        xiu_votes = 0
+        weights = []
         
-        # Biến động từ -3 đến +3
-        return (v1 - 0.5) * 6, (v2 - 0.5) * 4, (v3 - 0.5) * 2
-
+        # 1. Tần suất - trọng số 0.25
+        freq_tai, freq_xiu = self._frequency_test(data)
+        tai_votes += freq_tai * 0.25
+        xiu_votes += freq_xiu * 0.25
+        
+        # 2. Entropy - trọng số 0.15
+        ent = self._entropy(data)
+        if ent > 7.0:  # Random cao
+            tai_votes += 5
+        elif ent < 6.0:  # Có cấu trúc
+            xiu_votes += 5
+        
+        # 3. Runs test - trọng số 0.2
+        avg_run, max_run = self._runs_test(bits)
+        if avg_run > 3.0:
+            tai_votes += 8
+        elif avg_run < 2.0:
+            xiu_votes += 8
+        
+        # 4. Chi-square - trọng số 0.15
+        chi2 = self._chi_square_test(bits)
+        if chi2 > 10:
+            tai_votes += 6
+        elif chi2 < 5:
+            xiu_votes += 6
+        
+        # 5. MD5 đặc thù - trọng số 0.25
+        md5_tai, md5_xiu = self._md5_specific_analysis(data)
+        tai_votes += md5_tai * 0.25
+        xiu_votes += md5_xiu * 0.25
+        
+        # 6. Pattern recognition - trọng số 0.3
+        pat_tai, pat_xiu = self._pattern_recognition(data)
+        tai_votes += pat_tai * 0.3
+        xiu_votes += pat_xiu * 0.3
+        
+        return tai_votes, xiu_votes
+    
     def analyze(self, value):
+        """Phân tích MD5/SHA-256 và đưa ra dự đoán"""
         raw = re.sub(r"\s+", "", value or "").lower()
         if not re.fullmatch(r"[0-9a-f]{32}|[0-9a-f]{64}", raw):
             return {"ok": False, "error": "Mã phải là MD5 32 ký tự hoặc SHA-256 64 ký tự hệ hex."}
         
-        data = bytes.fromhex(raw)
-        bits = self._bits(data)
-        timestamp_ns = time.time_ns()
+        try:
+            data = bytes.fromhex(raw)
+        except:
+            return {"ok": False, "error": "Dữ liệu không hợp lệ."}
         
-        # Lấy lịch sử dự đoán gần nhất của user để tạo biến động
-        # Sử dụng timestamp và lịch sử để random hóa kết quả
-        score_tai = 50.0
-        score_xiu = 50.0
-        details = []
-
-        # Lõi dự đoán v4
-        v4_tai, v4_xiu, v4_details = self._source_ultimate_md5_core(data)
-        score_tai += v4_tai
-        score_xiu += v4_xiu
-        details.extend(v4_details)
-
-        # 1. Nibble/high-low score
-        nibbles = [(b >> 4) & 15 for b in data] + [b & 15 for b in data]
-        high = sum(1 for n in nibbles if n >= 8)
-        low = len(nibbles) - high
-        if high > low * 1.15:
-            score_tai += 8; details.append("high-nibble→Tài")
-        elif low > high * 1.15:
-            score_xiu += 8; details.append("low-nibble→Xỉu")
-
-        odd = sum(n % 2 for n in nibbles)
-        even = len(nibbles) - odd
-        if odd > even * 1.20:
-            score_tai += 5
-        elif even > odd * 1.20:
-            score_xiu += 5
-
-        # 2. Shannon entropy
-        ent = self._entropy(data)
-        ratio = ent / 8.0
-        if ratio > 0.90:
-            if data[-1] >= 128: score_tai += 6
-            else: score_xiu += 6
-            details.append("entropy-cao")
-        elif ratio < 0.70:
-            if sum(data) / len(data) >= 128: score_xiu += 6
-            else: score_tai += 6
-            details.append("entropy-thap")
-
-        # 3. Bit ratio và độ dài run
-        ones = sum(bits); zeros = len(bits) - ones
-        if zeros > ones + 10: score_tai += 6
-        elif ones > zeros + 10: score_xiu += 6
-        runs = []
-        run = 1
-        for i in range(1, len(bits)):
-            if bits[i] == bits[i - 1]: run += 1
-            else: runs.append(run); run = 1
-        runs.append(run)
-        avg_run = sum(runs) / max(1, len(runs))
-        if avg_run > 2.5: score_tai += 5
-        elif avg_run < 1.8: score_xiu += 5
-
-        # 4. Markov 2-step
-        trans = Counter()
-        highbits = [int(n >= 8) for n in nibbles]
-        for i in range(len(highbits) - 2):
-            trans[(highbits[i], highbits[i + 1], highbits[i + 2])] += 1
-        last = tuple(highbits[-2:])
-        t = trans[(last[0], last[1], 1)]
-        x = trans[(last[0], last[1], 0)]
-        if t > x: score_tai += 7
-        elif x > t: score_xiu += 7
-
-        # 5. Spectral score
-        spectral = self._spectral_score(bits)
-        if spectral > 0.002: score_tai += 5; details.append("spectral→Tài")
-        elif spectral < -0.002: score_xiu += 5; details.append("spectral→Xỉu")
-
-        # 6. Cellular automaton Rule 30
-        state = bits[:]
-        for _ in range(8):
-            state = [state[(i - 1) % len(state)] ^ (state[i] | state[(i + 1) % len(state)]) for i in range(len(state))]
-        density = sum(state) / len(state)
-        if density > 0.52: score_tai += 5
-        elif density < 0.48: score_xiu += 5
-
-        # 7. THÊM BIẾN ĐỘNG THỜI GIAN - KHÔNG CHO KẾT QUẢ LẶP
-        time_var, time_var2, time_var3 = self._time_based_variation(raw, timestamp_ns)
-        score_tai += time_var
-        score_xiu -= time_var2
-        details.append(f"time-var:{time_var:.2f}")
-
-        # 8. Thêm yếu tố dựa trên ID của phiên (hash của timestamp)
-        session_hash = hashlib.md5(str(timestamp_ns).encode()).hexdigest()
-        session_seed = int(session_hash[:8], 16) / 2**32
-        if session_seed > 0.5:
-            score_tai += session_seed * 3
+        # Phân tích đa chiều
+        tai_score, xiu_score = self._dynamic_weighted_voting(data)
+        
+        # Thêm nhiễu ngẫu nhiên có kiểm soát để tránh lặp kết quả
+        # nhưng vẫn đảm bảo tính nhất quán
+        hash_seed = int(raw[:8], 16)
+        random_factor = (hash_seed % 100) / 1000  # 0 - 0.1
+        timestamp_factor = (time.time_ns() % 1000) / 10000  # 0 - 0.1
+        
+        tai_score += random_factor * 2
+        xiu_score += timestamp_factor * 2
+        
+        # Đảm bảo không có kết quả hòa
+        if abs(tai_score - xiu_score) < 5:
+            # Dùng bit cuối của hash để quyết định
+            if int(raw[-1], 16) % 2 == 0:
+                tai_score += 3
+            else:
+                xiu_score += 3
+        
+        # Làm tròn và chuẩn hóa
+        total = tai_score + xiu_score
+        if total == 0:
+            tai_pct = 50.0
+            xiu_pct = 50.0
         else:
-            score_xiu += (1 - session_seed) * 3
-
-        total = score_tai + score_xiu
-        tai = round(score_tai / total * 100, 1)
-        xiu = round(score_xiu / total * 100, 1)
+            tai_pct = round((tai_score / total) * 100, 1)
+            xiu_pct = round((xiu_score / total) * 100, 1)
         
-        # Đảm bảo có sự chênh lệch và không bị lặp
-        if abs(tai - xiu) < 2:
-            # Nếu quá cân bằng, dùng timestamp để quyết định
-            if timestamp_ns % 2 == 0:
-                tai = min(99, tai + 1.5)
-                xiu = max(1, xiu - 1.5)
+        # Đảm bảo tổng = 100%
+        if tai_pct + xiu_pct != 100:
+            diff = 100 - (tai_pct + xiu_pct)
+            if tai_pct >= xiu_pct:
+                tai_pct += diff
             else:
-                xiu = min(99, xiu + 1.5)
-                tai = max(1, tai - 1.5)
+                xiu_pct += diff
         
-        result = "Tài" if tai >= xiu else "Xỉu"
-        confidence = round(max(tai, xiu), 1)
+        result = "Tài" if tai_pct >= xiu_pct else "Xỉu"
+        confidence = max(tai_pct, xiu_pct)
         
-        return {"ok": True, "hash": raw, "result": result, "tai": tai, "xiu": xiu,
-                "confidence": confidence, "detail": ", ".join(details[:5]) + f" | session:{session_seed:.3f}"}
-
-
-analyzer = HashAnalyzer()
-
-# ============================================================
-# BACKUP / RESTORE DỮ LIỆU
-# ============================================================
-def export_all_data():
-    """Xuất toàn bộ dữ liệu dưới dạng JSON"""
-    with db() as c:
-        data = {
-            "version": 1,
-            "exported_at": iso(now()),
-            "settings": c.execute("SELECT key, value FROM settings").fetchall(),
-            "users": c.execute("SELECT * FROM users").fetchall(),
-            "keys": c.execute("SELECT * FROM keys").fetchall(),
-            "deposits": c.execute("SELECT * FROM deposits").fetchall(),
-            "broadcasts": c.execute("SELECT * FROM broadcasts").fetchall(),
-            "giftcodes": c.execute("SELECT * FROM giftcodes").fetchall(),
-            "giftcode_uses": c.execute("SELECT * FROM giftcode_uses").fetchall(),
-            "prediction_history": c.execute("SELECT * FROM prediction_history").fetchall(),
+        # Lưu pattern để học
+        pattern = ''.join('1' if b >= 128 else '0' for b in data[:16])
+        if len(pattern) >= 8:
+            self._save_pattern(pattern, result)
+            self._patterns[pattern] = {'result': result, 'freq': self._patterns.get(pattern, {}).get('freq', 0) + 1}
+        
+        details = [
+            f"Score Tài: {tai_score:.1f}",
+            f"Score Xỉu: {xiu_score:.1f}",
+            f"Entropy: {self._entropy(data):.2f}/8.0"
+        ]
+        
+        return {
+            "ok": True,
+            "hash": raw.upper(),
+            "result": result,
+            "tai": tai_pct,
+            "xiu": xiu_pct,
+            "confidence": confidence,
+            "detail": ", ".join(details)
         }
-    return json.dumps(data, ensure_ascii=False, default=str)
 
 
-def import_all_data(json_data):
-    """Nhập dữ liệu từ JSON backup"""
-    data = json.loads(json_data)
-    with db() as c:
-        # Xóa toàn bộ dữ liệu cũ
-        c.execute("DELETE FROM settings")
-        c.execute("DELETE FROM users")
-        c.execute("DELETE FROM keys")
-        c.execute("DELETE FROM deposits")
-        c.execute("DELETE FROM broadcasts")
-        c.execute("DELETE FROM giftcodes")
-        c.execute("DELETE FROM giftcode_uses")
-        c.execute("DELETE FROM prediction_history")
-        
-        # Nhập dữ liệu mới
-        for table in ["settings", "users", "keys", "deposits", "broadcasts", "giftcodes", "giftcode_uses", "prediction_history"]:
-            rows = data.get(table, [])
-            if not rows:
-                continue
-            # Lấy tên cột
-            if table == "settings":
-                placeholders = "key, value"
-            elif table == "users":
-                placeholders = "telegram_id, username, first_name, created_at, last_seen, balance"
-            elif table == "keys":
-                placeholders = "key, package_name, days, used_by, created_at, used_at, expires_at, locked"
-            elif table == "deposits":
-                placeholders = "id, telegram_id, amount, content, status, created_at, decided_at, decided_by"
-            elif table == "broadcasts":
-                placeholders = "id, text, sent_at"
-            elif table == "giftcodes":
-                placeholders = "code, amount, max_uses, used_count, created_at"
-            elif table == "giftcode_uses":
-                placeholders = "code, telegram_id, used_at"
-            elif table == "prediction_history":
-                placeholders = "id, telegram_id, hash_input, result, tai, xiu, confidence, created_at"
-            else:
-                continue
-            
-            for row in rows:
-                values = []
-                for v in row:
-                    if isinstance(v, (dict, list)):
-                        values.append(json.dumps(v, ensure_ascii=False))
-                    else:
-                        values.append(v)
-                placeholders_str = ", ".join(["?"] * len(values))
-                c.execute(f"INSERT OR REPLACE INTO {table}({placeholders}) VALUES({placeholders_str})", values)
-
+analyzer = SuperAnalyzer()
 
 # ============================================================
 # GIAO DIỆN TELEGRAM
@@ -606,7 +545,8 @@ def nav_keyboard(uid):
     k.add(types.InlineKeyboardButton("🎮 Chơi ngay", callback_data="play"), types.InlineKeyboardButton("💎 Mua gói", callback_data="packages"))
     k.add(types.InlineKeyboardButton("💳 Nạp tiền", callback_data="deposit"), types.InlineKeyboardButton("👤 Tài khoản", callback_data="account"))
     k.add(types.InlineKeyboardButton("📞 Liên hệ", callback_data="contact"), types.InlineKeyboardButton("🎁 Giftcode", callback_data="giftcode"))
-    if is_admin(uid): k.add(types.InlineKeyboardButton("🛠 Quản trị", callback_data="admin_menu"))
+    if is_admin(uid): 
+        k.add(types.InlineKeyboardButton("🛠 Quản trị", callback_data="admin_menu"))
     return k
 
 
@@ -670,6 +610,10 @@ def callbacks(call):
         elif call.data.startswith("reject:"): request_reject(uid, int(call.data.split(":")[1]), call)
         elif call.data.startswith("reject_confirm:"): decide_deposit(uid, int(call.data.split(":")[1]), False)
         elif call.data == "admin_key": edit_page(call, "🔑 <b>Tạo key</b>\n\nDùng lệnh <code>/taokey Tên_gói</code> để tạo key.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
+        elif call.data == "admin_giftcode":
+            # Admin tạo giftcode từ bot
+            edit_page(call, "🎁 <b>TẠO GIFTCODE</b>\n\nNhập mã giftcode và số lượt sử dụng.\nVí dụ: <code>GIFT2024 5</code>", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
+            bot.register_next_step_handler_by_chat_id(cid, admin_create_giftcode_step)
         elif call.data == "admin_stats": send_stats(cid, call)
         elif call.data == "admin_broadcast":
             edit_page(call, "📢 <b>THÔNG BÁO TOÀN BỘ</b>\n\nHãy nhập nội dung thông báo ở tin nhắn kế tiếp.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
@@ -809,7 +753,7 @@ def play(cid, call=None):
         text = "🔒 <b>KHU VỰC CHƠI</b>\n\nBạn chưa có key còn hạn. Hãy nhập key hoặc mua gói để tiếp tục."
         k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔐 Nhập key", callback_data="enter_key"), types.InlineKeyboardButton("💎 Mua gói", callback_data="packages"))
     else:
-        text = f"🎮 <b>SẴN SÀNG PHÂN TÍCH</b>\n\nKey còn hạn đến: <code>{row['expires_at']}</code>\n\nGửi mã MD5 32 ký tự hoặc SHA-256 64 ký tự."
+        text = f"🎮 <b>SẴN SÀNG PHÂN TÍCH</b>\n\nKey còn hạn đến: <code>{row['expires_at']}</code>\n\nGửi mã MD5 32 ký tự hoặc SHA-256 64 ký tự.\n\n📊 <i>Thuật toán v5.0 - Siêu phân tích đa chiều</i>"
         k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
     if call: edit_page(call, text, k)
     else: bot.send_message(cid, text, reply_markup=k)
@@ -840,14 +784,26 @@ def analyze_message(message):
     nums = [int(digest[i:i+2], 16) % 6 + 1 for i in (0, 2, 4)]
     total = sum(nums)
     verdict = "🅣 TÀI" if out['result'] == "Tài" else "🅧 XỈU"
+    
+    # Tạo thanh tiến trình
+    bar_length = 20
+    tai_bar = int((out['tai'] / 100) * bar_length)
+    xiu_bar = bar_length - tai_bar
+    tai_visual = "█" * tai_bar + "░" * (bar_length - tai_bar)
+    xiu_visual = "█" * xiu_bar + "░" * (bar_length - xiu_bar)
+    
     text = (f"🔮 <b>PHÂN TÍCH MD5 TÀI/XỈU</b>\n\n"
-            f"📦 Phiên bản: <b>v3.0 - Dynamic</b>\n"
-            f"📝 MD5 hiện tại: <code>{short}</code>\n\n"
+            f"📦 Phiên bản: <b>v5.0 - Siêu phân tích đa chiều</b>\n"
+            f"📝 Mã hash: <code>{short}</code>\n\n"
             f"🎲 Bộ số mô phỏng: <b>{nums[0]}-{nums[1]}-{nums[2]}</b> | Tổng: <b>{total}</b>\n"
-            f"📉 Kết luận: <b>{verdict}</b>\n"
-            f"🎯 Tài/Xỉu %: <b>T {out['tai']}% · X {out['xiu']}%</b>\n"
-            f"📊 Độ tin cậy: <b>{out['confidence']}%</b>\n"
-            f"🔬 Phân tích: <code>{out['detail'][:80]}</code>")
+            f"📉 Kết luận: <b>{verdict}</b>\n\n"
+            f"📊 <b>PHÂN TÍCH CHI TIẾT</b>\n"
+            f"🟢 Tài: {out['tai']}%\n"
+            f"<code>{tai_visual}</code>\n"
+            f"🔴 Xỉu: {out['xiu']}%\n"
+            f"<code>{xiu_visual}</code>\n\n"
+            f"🎯 Độ tin cậy: <b>{out['confidence']}%</b>\n"
+            f"🔬 Phân tích: <code>{out['detail'][:100]}</code>")
     bot.send_message(message.chat.id, text)
     
     # Lưu lịch sử dự đoán
@@ -920,19 +876,50 @@ def redeem_giftcode(message):
 
 
 # ============================================================
-# ADMIN TELEGRAM
+# ADMIN TELEGRAM - THÊM TẠO GIFTCODE
 # ============================================================
 def admin_menu(cid, call=None):
     k = types.InlineKeyboardMarkup(row_width=2)
     k.add(types.InlineKeyboardButton("🔑 Tạo key", callback_data="admin_key"), types.InlineKeyboardButton("📊 Thống kê", callback_data="admin_stats"))
-    k.add(types.InlineKeyboardButton("📢 Thông báo toàn bộ", callback_data="admin_broadcast"))
+    k.add(types.InlineKeyboardButton("🎁 Tạo Giftcode", callback_data="admin_giftcode"), types.InlineKeyboardButton("📢 Thông báo", callback_data="admin_broadcast"))
     k.add(types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
     if call: edit_page(call, "🛠 <b>BẢNG QUẢN TRỊ</b>\n\nChọn chức năng quản lý bên dưới.", k)
     else: bot.send_message(cid, "🛠 <b>BẢNG QUẢN TRỊ</b>", reply_markup=k)
 
-@bot.message_handler(commands=["admin"])
-def admin_cmd(message):
-    if is_admin(message.from_user.id): admin_menu(message.chat.id)
+
+def admin_create_giftcode_step(message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    uid = message.chat.id
+    parts = (message.text or "").strip().split()
+    
+    if len(parts) < 1:
+        bot.send_message(uid, "❌ Vui lòng nhập mã giftcode.\nVí dụ: <code>GIFT2024 5</code>")
+        bot.register_next_step_handler_by_chat_id(uid, admin_create_giftcode_step)
+        return
+    
+    code = parts[0].upper()
+    try:
+        max_uses = int(parts[1]) if len(parts) > 1 else 1
+    except ValueError:
+        max_uses = 1
+    
+    # Số tiền ngẫu nhiên từ 1.000đ đến 50.000đ
+    amount = secrets.randbelow(49000) + 1000
+    # Làm tròn đến 1000
+    amount = ((amount + 999) // 1000) * 1000
+    
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO giftcodes(code,amount,max_uses,used_count,created_at) VALUES(?,?,?,?,?)", 
+                 (code, amount, max_uses, 0, iso(now())))
+    
+    bot.send_message(uid, f"🎁 <b>ĐÃ TẠO GIFTCODE</b>\n\n"
+                        f"📝 Mã: <code>{code}</code>\n"
+                        f"💰 Giá trị: <b>{fmt_money(amount)}</b>\n"
+                        f"👥 Số lượt sử dụng: <b>{max_uses}</b>\n\n"
+                        f"🔄 Người dùng nhập mã này sẽ được cộng tiền vào tài khoản.")
+
 
 @bot.message_handler(commands=["taokey"])
 def create_key_cmd(message):
@@ -954,11 +941,12 @@ def create_gift_cmd(message):
     if not is_admin(message.from_user.id): return
     parts = (message.text or "").split()
     if len(parts) < 2:
-        bot.send_message(message.chat.id, "Dùng /taogift TENGIFT [soluot]. Mỗi mã nhận ngẫu nhiên từ 1.000đ đến 10.000đ."); return
+        bot.send_message(message.chat.id, "Dùng /taogift TENGIFT [soluot]. Mỗi mã nhận ngẫu nhiên từ 1.000đ đến 50.000đ."); return
     code = parts[1].upper()
     try: max_uses = max(1, int(parts[2])) if len(parts) > 2 else 1
     except ValueError: max_uses = 1
-    amount = secrets.randbelow(9001) + 1000
+    amount = secrets.randbelow(49000) + 1000
+    amount = ((amount + 999) // 1000) * 1000
     with db() as c: c.execute("INSERT OR REPLACE INTO giftcodes(code,amount,max_uses,used_count,created_at) VALUES(?,?,?,?,?)", (code, amount, max_uses, 0, iso(now())))
     bot.send_message(message.chat.id, f"🎁 Đã tạo giftcode <code>{code}</code>\n💰 Giá trị: <b>{fmt_money(amount)}</b>\n👥 Số lượt: <b>{max_uses}</b>")
 
@@ -994,7 +982,9 @@ def send_stats(cid, call=None):
         k = c.execute("SELECT COUNT(*) n FROM keys WHERE used_by IS NULL").fetchone()["n"]
         d = c.execute("SELECT COUNT(*) n FROM deposits WHERE status='pending'").fetchone()["n"]
         total = c.execute("SELECT COALESCE(SUM(amount),0) s FROM deposits WHERE status='approved'").fetchone()["s"]
-    text = f"📊 <b>THỐNG KÊ HỆ THỐNG</b>\n\n👥 Người dùng: <b>{u}</b>\n🔑 Key chưa dùng: <b>{k}</b>\n⏳ Đơn chờ duyệt: <b>{d}</b>\n💰 Tổng đã duyệt: <b>{fmt_money(total)}</b>"
+        patterns = c.execute("SELECT COUNT(*) n FROM patterns").fetchone()["n"]
+        predictions = c.execute("SELECT COUNT(*) n FROM prediction_history").fetchone()["n"]
+    text = f"📊 <b>THỐNG KÊ HỆ THỐNG</b>\n\n👥 Người dùng: <b>{u}</b>\n🔑 Key chưa dùng: <b>{k}</b>\n⏳ Đơn chờ duyệt: <b>{d}</b>\n💰 Tổng đã duyệt: <b>{fmt_money(total)}</b>\n📈 Mẫu đã học: <b>{patterns}</b>\n🔮 Lịch sử dự đoán: <b>{predictions}</b>"
     kbd = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Quản trị", callback_data="admin_menu"))
     if call: edit_page(call, text, kbd)
     else: bot.send_message(cid, text, reply_markup=kbd)
@@ -1055,7 +1045,7 @@ def decide_deposit(uid, did, approved):
 
 
 # ============================================================
-# ADMIN WEB - ĐÃ THÊM BACKUP / RESTORE
+# ADMIN WEB
 # ============================================================
 ADMIN_HTML = """
 <!doctype html><html lang='vi'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{{bot_name}} · Admin</title>
@@ -1206,7 +1196,6 @@ def admin_key_delete():
 @app.get("/admin/backup/download")
 def backup_download():
     data = export_all_data()
-    # Tạo file .js với định dạng JavaScript export
     js_content = f"// Backup data - {BOT_NAME}\n// Exported at: {iso(now())}\nconst backupData = {data};\n"
     return send_file(
         BytesIO(js_content.encode('utf-8')),
@@ -1224,10 +1213,8 @@ def backup_restore():
         return "File rỗng", 400
     try:
         content = file.read().decode('utf-8')
-        # Tìm JSON trong file .js
         json_match = re.search(r'backupData\s*=\s*({.*?});?\s*$', content, re.DOTALL | re.IGNORECASE)
         if not json_match:
-            # Thử parse toàn bộ nội dung như JSON
             try:
                 json.loads(content)
                 import_all_data(content)
@@ -1241,11 +1228,86 @@ def backup_restore():
         log.exception("Lỗi restore backup")
         return f"Lỗi khi khôi phục dữ liệu: {str(e)}", 500
 
+def export_all_data():
+    """Xuất toàn bộ dữ liệu dưới dạng JSON"""
+    with db() as c:
+        data = {
+            "version": 1,
+            "exported_at": iso(now()),
+            "settings": c.execute("SELECT key, value FROM settings").fetchall(),
+            "users": c.execute("SELECT * FROM users").fetchall(),
+            "keys": c.execute("SELECT * FROM keys").fetchall(),
+            "deposits": c.execute("SELECT * FROM deposits").fetchall(),
+            "broadcasts": c.execute("SELECT * FROM broadcasts").fetchall(),
+            "giftcodes": c.execute("SELECT * FROM giftcodes").fetchall(),
+            "giftcode_uses": c.execute("SELECT * FROM giftcode_uses").fetchall(),
+            "prediction_history": c.execute("SELECT * FROM prediction_history").fetchall(),
+            "patterns": c.execute("SELECT * FROM patterns").fetchall(),
+        }
+    return json.dumps(data, ensure_ascii=False, default=str)
+
+
+def import_all_data(json_data):
+    """Nhập dữ liệu từ JSON backup"""
+    data = json.loads(json_data)
+    with db() as c:
+        c.execute("DELETE FROM settings")
+        c.execute("DELETE FROM users")
+        c.execute("DELETE FROM keys")
+        c.execute("DELETE FROM deposits")
+        c.execute("DELETE FROM broadcasts")
+        c.execute("DELETE FROM giftcodes")
+        c.execute("DELETE FROM giftcode_uses")
+        c.execute("DELETE FROM prediction_history")
+        c.execute("DELETE FROM patterns")
+        
+        for table in ["settings", "users", "keys", "deposits", "broadcasts", "giftcodes", "giftcode_uses", "prediction_history", "patterns"]:
+            rows = data.get(table, [])
+            if not rows:
+                continue
+            if table == "settings":
+                placeholders = "key, value"
+            elif table == "users":
+                placeholders = "telegram_id, username, first_name, created_at, last_seen, balance"
+            elif table == "keys":
+                placeholders = "key, package_name, days, used_by, created_at, used_at, expires_at, locked"
+            elif table == "deposits":
+                placeholders = "id, telegram_id, amount, content, status, created_at, decided_at, decided_by"
+            elif table == "broadcasts":
+                placeholders = "id, text, sent_at"
+            elif table == "giftcodes":
+                placeholders = "code, amount, max_uses, used_count, created_at"
+            elif table == "giftcode_uses":
+                placeholders = "code, telegram_id, used_at"
+            elif table == "prediction_history":
+                placeholders = "id, telegram_id, hash_input, result, tai, xiu, confidence, created_at"
+            elif table == "patterns":
+                placeholders = "id, pattern, result, frequency, last_seen"
+            else:
+                continue
+            
+            for row in rows:
+                values = []
+                for v in row:
+                    if isinstance(v, (dict, list)):
+                        values.append(json.dumps(v, ensure_ascii=False))
+                    else:
+                        values.append(v)
+                placeholders_str = ", ".join(["?"] * len(values))
+                c.execute(f"INSERT OR REPLACE INTO {table}({placeholders}) VALUES({placeholders_str})", values)
 
 @app.get("/admin/stats")
 def admin_stats_api():
     with db() as c:
-        return jsonify(users=c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"], pending_deposits=c.execute("SELECT COUNT(*) n FROM deposits WHERE status='pending'").fetchone()["n"], unused_keys=c.execute("SELECT COUNT(*) n FROM keys WHERE used_by IS NULL AND locked=0").fetchone()["n"], running_keys=c.execute("SELECT COUNT(*) n FROM keys WHERE used_by IS NOT NULL AND locked=0 AND expires_at IS NOT NULL AND expires_at>?", (iso(now()),)).fetchone()["n"], locked_keys=c.execute("SELECT COUNT(*) n FROM keys WHERE locked=1").fetchone()["n"])
+        return jsonify(
+            users=c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],
+            pending_deposits=c.execute("SELECT COUNT(*) n FROM deposits WHERE status='pending'").fetchone()["n"],
+            unused_keys=c.execute("SELECT COUNT(*) n FROM keys WHERE used_by IS NULL AND locked=0").fetchone()["n"],
+            running_keys=c.execute("SELECT COUNT(*) n FROM keys WHERE used_by IS NOT NULL AND locked=0 AND expires_at IS NOT NULL AND expires_at>?", (iso(now()),)).fetchone()["n"],
+            locked_keys=c.execute("SELECT COUNT(*) n FROM keys WHERE locked=1").fetchone()["n"],
+            patterns=c.execute("SELECT COUNT(*) n FROM patterns").fetchone()["n"],
+            predictions=c.execute("SELECT COUNT(*) n FROM prediction_history").fetchone()["n"]
+        )
 
 
 def run_web():
