@@ -10,6 +10,7 @@ import logging
 import threading
 import io
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from collections import Counter
 
@@ -57,6 +58,9 @@ bot = telebot.TeleBot(BOT_TOKEN or _RUNTIME_PLACEHOLDER, parse_mode="HTML", thre
 app = Flask(__name__)
 _polling_started = False
 _polling_lock = threading.Lock()
+SESSION_CACHE = {}
+SESSION_CACHE_LOCK = threading.Lock()
+AUTO_REFRESH_SECONDS = max(15, int(os.getenv("AUTO_REFRESH_SECONDS", "30")))
 
 # ============================================================
 # DATABASE: SQLite để đáp ứng yêu cầu chỉ 2 file
@@ -336,33 +340,41 @@ def _deep_items(value):
 def api_sessions(url):
     if not url: return [], 'API chưa được cấu hình'
     try:
-        r = requests.get(url, timeout=10, headers={'Accept':'application/json','User-Agent':'MD5TX-Bot/2.0'})
-        r.raise_for_status(); data = r.json()
+        r=requests.get(url,timeout=10,headers={'Accept':'application/json','User-Agent':'MD5TX-Bot/2.0'}); r.raise_for_status(); data=r.json()
     except Exception as exc:
-        log.warning('game api error %s: %s', url, exc)
-        return [], 'API không phản hồi hoặc JSON không hợp lệ'
-    out = []
-    candidates = data if isinstance(data, list) else list(_deep_items(data))
+        log.warning('game api error: %s', exc)
+        with SESSION_CACHE_LOCK: cached=SESSION_CACHE.get(url,{}).get('sessions',[])
+        return cached, ('API đang lỗi; đang dùng dữ liệu phiên gần nhất' if cached else 'API không phản hồi hoặc JSON không hợp lệ')
+    out=[]; candidates=data if isinstance(data,list) else list(_deep_items(data))
     for row in candidates:
-        sid = next((row.get(k) for k in ('sid','session','sessionId','phien','id','round','issueId') if row.get(k) not in (None,'')), 0)
-        total = next((row.get(k) for k in ('total','sum','score','tong','point','DiceSum') if row.get(k) not in (None,'')), None)
-        result = next((row.get(k) for k in ('res','result','ket_qua','ketqua','tx','type','BetSide') if row.get(k) not in (None,'')), '')
-        dice = next((row.get(k) for k in ('dice','dices','xucxac','xuc_xac') if isinstance(row.get(k), list) and len(row.get(k)) >= 3), [])
-        if total is None and len(dice) >= 3 and all(str(x).isdigit() for x in dice[:3]): total = sum(map(int, dice[:3]))
-        text = str(result).lower()
-        if 'tài' in text or 'tai' in text or text in ('t','big','0'): side = 'T'
-        elif 'xỉu' in text or 'xiu' in text or text in ('x','small','1'): side = 'X'
-        elif str(total).isdigit(): side = 'T' if int(total) >= 11 else 'X'
+        sid=next((row.get(k) for k in ('sid','session','sessionId','phien','id','round','issueId') if row.get(k) not in (None,'')),0)
+        total=next((row.get(k) for k in ('total','sum','score','tong','point','DiceSum') if row.get(k) not in (None,'')),None)
+        result=next((row.get(k) for k in ('res','result','ket_qua','ketqua','tx','type','BetSide') if row.get(k) not in (None,'')),'')
+        dice=next((row.get(k) for k in ('dice','dices','xucxac','xuc_xac') if isinstance(row.get(k),list) and len(row.get(k))>=3),[])
+        if total is None and len(dice)>=3 and all(str(x).isdigit() for x in dice[:3]): total=sum(map(int,dice[:3]))
+        text=str(result).lower()
+        if 'tài' in text or 'tai' in text or text in ('t','big','0'): side='T'
+        elif 'xỉu' in text or 'xiu' in text or text in ('x','small','1'): side='X'
+        elif str(total).isdigit(): side='T' if int(total)>=11 else 'X'
         else: continue
-        try: sid = int(str(sid).split('.')[0])
-        except Exception: sid = 0
+        try: sid=int(str(sid).split('.')[0])
+        except Exception: sid=0
         out.append({'sid':sid,'total':int(total or 0),'res':side,'dice':dice[:3]})
-    unique = {}
+    unique={}
     for row in out:
-        if row['sid'] not in unique or unique[row['sid']]['total'] == 0: unique[row['sid']] = row
-    out = sorted(unique.values(), key=lambda x: x['sid'], reverse=True)
-    return out[:120], ''
+        if row['sid'] not in unique or unique[row['sid']]['total']==0: unique[row['sid']]=row
+    out=sorted(unique.values(),key=lambda x:x['sid'],reverse=True)[:120]
+    with SESSION_CACHE_LOCK: SESSION_CACHE[url]={'sessions':out,'sid':out[0]['sid'] if out else 0,'updated':time.time()}
+    return out,'' if out else 'API chưa có lịch sử phiên hợp lệ'
 
+def refresh_all_api_sessions():
+    """Polling nền: mỗi chu kỳ gọi lại API game và lưu phiên mới vào cache."""
+    while True:
+        try:
+            with db() as c: urls=[r['api_url'] for r in c.execute("SELECT api_url FROM games WHERE enabled=1 AND COALESCE(locked,0)=0 AND COALESCE(maintenance,0)=0 AND api_url<>''").fetchall()]
+            with ThreadPoolExecutor(max_workers=min(6,max(1,len(urls)))) as pool: list(pool.map(api_sessions,urls))
+        except Exception: log.exception('auto api refresh error')
+        time.sleep(AUTO_REFRESH_SECONDS)
 def game_keyboard(category):
     k = types.InlineKeyboardMarkup(row_width=2)
     for g in game_rows(category): k.add(types.InlineKeyboardButton(f"{g['emoji']} {g['name']}", callback_data='game:'+g['slug']))
@@ -601,13 +613,12 @@ def choose_game(cid, category, call=None):
     else: bot.send_message(cid, text, reply_markup=game_keyboard(category))
 
 def _api_result_text(g, sessions, out):
-    api_host=re.sub(r'^https?://','',str(g['api_url'])).split('/')[0]
     if not out.get('ok'):
-        return f"{g['emoji']} <b>{html.escape(g['name'])}</b>\n\n📡 API phiên: <code>{html.escape(api_host)}</code>\n\n⚠️ {html.escape(out.get('error','API chưa trả dữ liệu hợp lệ'))}"
+        return f"{g['emoji']} <b>{html.escape(g['name'])}</b>\n\n📡 Trạng thái dữ liệu: <b>{'Đang dùng lịch sử gần nhất' if sessions else 'Chưa đồng bộ được'}</b>\n\n⚠️ {html.escape(out.get('error','API chưa trả dữ liệu hợp lệ'))}"
     label='TÀI' if out['pick']=='T' else 'XỈU'
     hist=' · '.join(str(x) for x in out.get('history',[])[:12])
     return (f"{g['emoji']} <b>{html.escape(g['name'])}</b>\n\n"
-            f"📡 API phiên: <code>{html.escape(str(g['api_url']))}</code>\n"
+            f"📡 Trạng thái dữ liệu: <b>Đã cập nhật tự động</b>\n"
             f"📌 Phiên: <code>{out.get('sid') or '—'}</code>\n"
             f"🔮 Phiên dự đoán: <code>{out.get('next') or '—'}</code>\n"
             f"🎯 Dự đoán: <b>{label}</b>\n"
@@ -1114,6 +1125,7 @@ def run_web():
 if __name__ == "__main__":
     init_db()
     sync_games_from_json()
+    threading.Thread(target=refresh_all_api_sessions, daemon=True, name="api-auto-refresh").start()
     # Luôn mở web admin trước. Token có thể nhập từ /admin sau khi Render chạy.
     start_bot_if_configured()
     threading.Thread(target=run_web, daemon=True, name="flask-admin").start()
