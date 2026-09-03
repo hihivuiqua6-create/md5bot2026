@@ -8,17 +8,13 @@ import sqlite3
 import hashlib
 import logging
 import threading
-import io
-import zipfile
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from collections import Counter
 
 import requests
 import telebot
 from telebot import types
-from flask import Flask, request, redirect, render_template_string, jsonify, send_file
-from predictor import HashAnalyzer, predict_sessions
+from flask import Flask, request, redirect, render_template_string, jsonify
 
 # ============================================================
 # CẤU HÌNH QUA BIẾN MÔI TRƯỜNG
@@ -28,8 +24,6 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "8030294480").split(
 PORT = int(os.getenv("PORT", "10000"))
 DB_PATH = os.getenv("DB_PATH", "bot.sqlite3")
 BOT_NAME = os.getenv("BOT_NAME", "MD5 Tài Xỉu Pro")
-GAME_CONFIG_PATH = os.getenv("GAME_CONFIG_PATH", os.path.join(os.path.dirname(__file__), "games_api.json"))
-BUILTIN_GAME_APIS = [{'name': 'LC79 Tài Xỉu', 'slug': 'lc79-tx', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://lc79.bet', 'api_url': 'https://wtx.tele68.com/v1/tx/sessions', 'tables_api': '', 'image': 'https://files.catbox.moe/ng8pg8.jfif', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 0}, {'name': 'LC79 MD5', 'slug': 'lc79-md5', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://lc79.bet', 'api_url': 'https://wtxmd52.tele68.com/v1/txmd5/sessions', 'tables_api': '', 'image': 'https://files.catbox.moe/ng8pg8.jfif', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 1}, {'name': 'BetVip Hũ', 'slug': 'betvip-hu', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://play.betvip.hot/?utm_source=seo&utm_campaign=betvip.jp.net&utm_medium=betvip.jp.net&utm_term=betvip.jp.net', 'api_url': 'https://wtx.macminim6.online/v1/tx/sessions', 'tables_api': '', 'image': 'https://files.catbox.moe/2gu29f.jpg', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 2}, {'name': 'BetVip MD5', 'slug': 'betvip-md5', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://play.betvip.hot/?utm_source=seo&utm_campaign=betvip.jp.net&utm_medium=betvip.jp.net&utm_term=betvip.jp.net', 'api_url': 'https://wtxmd52.macminim6.online/v1/txmd5/sessions', 'tables_api': '', 'image': 'https://files.catbox.moe/2gu29f.jpg', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 3}, {'name': 'Sunwin Tài Xỉu', 'slug': 'sunwin-tx', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://web.sunwin.works/?affId=Sunwin', 'api_url': 'https://cancer-counted-board-dam.trycloudflare.com/api/taixiu/history', 'tables_api': '', 'image': 'https://files.catbox.moe/ny0ayd.jpg', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 4}, {'name': 'Sunwin Sicbo', 'slug': 'sunwin-sicbo', 'cat': 'sicbo', 'kind': 'view', 'game_url': 'https://web.sunwin.works/?affId=Sunwin', 'api_url': 'https://api.wsktnus8.net/v2/history/getLastResult?gameId=ktrng_3979&size=100&tableId=39791215743193&curPage=1', 'tables_api': '', 'image': 'https://files.catbox.moe/61ohn2.jpg', 'hot': 0, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 5}, {'name': 'Max789 Hũ', 'slug': 'max789-hu', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://play.max789.vin/', 'api_url': 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau', 'tables_api': '', 'image': 'https://files.catbox.moe/lsz8db.jpg', 'hot': 1, 'vip': 1, 'is_new': 1, 'enabled': 1, 'maintenance': 0, 'sort': 6}, {'name': 'Max789 MD5', 'slug': 'max789-md5', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://play.max789.vin/', 'api_url': 'https://max789-nqfd.onrender.com/api/taixiumd5/max789', 'tables_api': '', 'image': 'https://files.catbox.moe/lsz8db.jpg', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 7}, {'name': '789Club Sicbo', 'slug': '789-sicbo', 'cat': 'sicbo', 'kind': 'view', 'game_url': '', 'api_url': 'https://api.xeuigogo.info/v2/history/getLastResult?gameId=ktrng_3986&size=100&tableId=39861215743193&curPage=1', 'tables_api': '', 'image': 'https://files.catbox.moe/jx3lid.jpg', 'hot': 0, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 8}, {'name': 'Hitclub Tài Xỉu', 'slug': 'hit-tx', 'cat': 'taixiu', 'kind': 'panel', 'game_url': '', 'api_url': 'https://commission-comply-opened-ethnic.trycloudflare.com/api/tx', 'tables_api': '', 'image': 'https://files.catbox.moe/w2lk5r.jpg', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 1, 'sort': 9}, {'name': 'Hitclub MD5', 'slug': 'hit-md5', 'cat': 'taixiu', 'kind': 'panel', 'game_url': '', 'api_url': 'https://apihitclubmd5-x6r3.onrender.com/', 'tables_api': '', 'image': 'https://files.catbox.moe/w2lk5r.jpg', 'hot': 1, 'vip': 1, 'is_new': 1, 'enabled': 1, 'maintenance': 0, 'sort': 10}, {'name': 'Hitclub Sicbo', 'slug': 'hit-sicbo', 'cat': 'sicbo', 'kind': 'panel', 'game_url': '', 'api_url': 'https://api.wsmt8g.cc/v2/history/getLastResult?gameId=ktrng_3932&size=120&tableId=39321215743193&curPage=1', 'tables_api': '', 'image': 'https://files.catbox.moe/w2lk5r.jpg', 'hot': 0, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 11}, {'name': 'B52 Tài Xỉu', 'slug': 'b52-tx', 'cat': 'taixiu', 'kind': 'panel', 'game_url': '', 'api_url': 'https://b52-qiw2.onrender.com/api/history', 'tables_api': '', 'image': 'https://files.catbox.moe/yfwwxu.jpg', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 12}, {'name': 'B52 Sicbo', 'slug': 'b52-sicbo', 'cat': 'sicbo', 'kind': 'panel', 'game_url': '', 'api_url': 'https://api.wsmt8g.cc/v2/history/getLastResult?gameId=ktrng_3996&size=100&tableId=39961215743193&curPage=1', 'tables_api': '', 'image': 'https://files.catbox.moe/yfwwxu.jpg', 'hot': 0, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 14}, {'name': 'Baccarat AI', 'slug': 'baccarat', 'cat': 'baccarat', 'kind': 'baccarat', 'game_url': 'https://fly88m.cc/', 'api_url': 'https://apisieunhanh.lovable.app/api/public/bYoIEro5CgRHbfQ0qBgcYJYy1rfUTRafwqcZh0ta/apibaccarat', 'tables_api': 'https://apisieunhanh.lovable.app/api/public/bYoIEro5CgRHbfQ0qBgcYJYy1rfUTRafwqcZh0ta/apibaccarat', 'image': 'https://files.catbox.moe/5ughb8.png', 'hot': 1, 'vip': 1, 'is_new': 1, 'enabled': 1, 'maintenance': 0, 'sort': 15}, {'name': 'Xocdiax88 Hũ', 'slug': 'Xocdiax88Hu', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://play.xocdia88.news/', 'api_url': 'https://taixiu.system32-cloudfare-356783752985678522.monster/api/luckydice/GetSoiCau', 'tables_api': '', 'image': 'https://files.catbox.moe/7eg34c.jpeg', 'hot': 0, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 99}, {'name': 'Xocdiax88 Md5', 'slug': 'Xocdiax88Md5', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://play.xocdia88.news/', 'api_url': 'https://taixiumd5.system32-cloudfare-356783752985678522.monster/api/md5luckydice/GetSoiCau', 'tables_api': '', 'image': 'https://files.catbox.moe/7eg34c.jpeg', 'hot': 0, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 99}]
 
 # Không đặt thông tin ngân hàng thật trong mã nguồn. Có thể sửa tại /admin.
 DEFAULT_BANK = {
@@ -58,9 +52,6 @@ bot = telebot.TeleBot(BOT_TOKEN or _RUNTIME_PLACEHOLDER, parse_mode="HTML", thre
 app = Flask(__name__)
 _polling_started = False
 _polling_lock = threading.Lock()
-SESSION_CACHE = {}
-SESSION_CACHE_LOCK = threading.Lock()
-AUTO_REFRESH_SECONDS = max(15, int(os.getenv("AUTO_REFRESH_SECONDS", "30")))
 
 # ============================================================
 # DATABASE: SQLite để đáp ứng yêu cầu chỉ 2 file
@@ -102,38 +93,7 @@ def init_db():
             code TEXT NOT NULL, telegram_id INTEGER NOT NULL, used_at TEXT NOT NULL,
             PRIMARY KEY(code, telegram_id)
         );
-        CREATE TABLE IF NOT EXISTS games (
-            slug TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, emoji TEXT NOT NULL,
-            api_url TEXT NOT NULL DEFAULT '', mode TEXT NOT NULL DEFAULT 'api',
-            enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
-        );
         """)
-        default_games = [
-            ('sunwin-tx','Sunwin Tài Xỉu','tx','🎲','api',''),
-            ('sunwin-sicbo','Sunwin Sicbo','sicbo','🎯','api',''),
-            ('lc79-tx','LC79 Tài Xỉu','tx','🔥','api',''),
-            ('lc79-md5','LC79 MD5','tx','🔐','md5',''),
-            ('betvip-hu','BetVip Hũ','tx','💰','api',''),
-            ('betvip-md5','BetVip MD5','tx','🧿','md5',''),
-            ('max789-hu','Max789 Hũ','tx','💎','api',''),
-            ('max789-md5','Max789 MD5','tx','🧪','md5',''),
-            ('789-sicbo','789 Sicbo','sicbo','🎰','api',''),
-            ('hit-tx','Hit Tài Xỉu','tx','⚡','api',''),
-            ('hit-sicbo','Hit Sicbo','sicbo','🎳','api',''),
-            ('b52-tx','B52 Tài Xỉu','tx','🛩️','api',''),
-                    ('b52-sicbo','B52 Sicbo','sicbo','🎲','api',''),
-            ('baccarat','Baccarat','baccarat','🃏','api',''),
-        ]
-        for slug, name, category, emoji, mode, api_url in default_games:
-            c.execute("INSERT OR IGNORE INTO games(slug,name,category,emoji,mode,api_url,created_at) VALUES(?,?,?,?,?,?,?)", (slug,name,category,emoji,mode,api_url,iso(now())))
-        # JSON sẽ được đồng bộ sau khi init_db hoàn tất.
-
-        gift_cols = [r[1] for r in c.execute("PRAGMA table_info(giftcodes)").fetchall()]
-        game_cols = [r[1] for r in c.execute("PRAGMA table_info(games)").fetchall()]
-        if "locked" not in game_cols: c.execute("ALTER TABLE games ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")
-        if "maintenance" not in game_cols: c.execute("ALTER TABLE games ADD COLUMN maintenance INTEGER NOT NULL DEFAULT 0")
-        if "active" not in gift_cols:
-            c.execute("ALTER TABLE giftcodes ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
         key_cols = [r[1] for r in c.execute("PRAGMA table_info(keys)").fetchall()]
         if "locked" not in key_cols:
             c.execute("ALTER TABLE keys ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")
@@ -291,95 +251,248 @@ def user_key(uid):
 # Trích ý tưởng từ file mẫu: nibble, entropy, bit-run, Markov 2 bước,
 # phổ tần số và cellular rule 30. Không random, không math.random.
 # Lưu ý: hash ngẫu nhiên không chứa thông tin bảo đảm kết quả trò chơi.
-# ========analyzer = HashAnalyzer() "tổng hợp deterministic"}
+# ============================================================
+class HashAnalyzer:
+    @staticmethod
+    def _bits(data):
+        return [(b >> (7 - i)) & 1 for b in data for i in range(8)]
+
+    @staticmethod
+    def _entropy(values):
+        if not values:
+            return 0.0
+        cnt = Counter(values)
+        n = len(values)
+        return -sum((v / n) * __import__('math').log2(v / n) for v in cnt.values())
+
+    @staticmethod
+    def _spectral_score(bits):
+        # DFT thủ công, tránh thêm dependency và giữ tính tái lập.
+        import math
+        n = len(bits)
+        if n < 16:
+            return 0.0
+        score = 0.0
+        for k in range(1, min(n // 2, 32)):
+            re_part = sum(bits[t] * math.cos(2 * math.pi * k * t / n) for t in range(n))
+            im_part = sum(bits[t] * math.sin(2 * math.pi * k * t / n) for t in range(n))
+            power = re_part * re_part + im_part * im_part
+            score += power * (1 if k % 2 else -1)
+        return score / (n * n)
+
+    def _source_spectral_density(self, data):
+        """Phần spectral density được trích từ md5bot.py, chỉ nhận bytes MD5."""
+        if len(data) < 16:
+            return 0.0, 0.0
+        n = len(data)
+        harmonics = []
+        import math
+        for k in range(n // 2):
+            real = sum(data[t] * math.cos(2 * math.pi * k * t / n) for t in range(n))
+            imag = sum(data[t] * math.sin(2 * math.pi * k * t / n) for t in range(n))
+            harmonics.append(real * real + imag * imag)
+        if not harmonics:
+            return 0.0, 0.0
+        total = sum(harmonics) + 1e-9
+        odd_power = sum(harmonics[i] for i in range(1, len(harmonics), 2))
+        even_power = sum(harmonics[i] for i in range(0, len(harmonics), 2))
+        tai = xiu = 0.0
+        spectral_bias = (odd_power - even_power) / total
+        if spectral_bias > 0.15:
+            tai += 16.0
+        elif spectral_bias < -0.15:
+            xiu += 16.0
+        centroid = sum(i * power for i, power in enumerate(harmonics)) / total
+        if centroid > len(harmonics) / 2:
+            tai += 10.0
+        else:
+            xiu += 10.0
+        return tai, xiu
+
+    def _source_cellular_rule30(self, data):
+        """Rule 30 trong md5bot.py, giữ độc lập với các phần kết nối bên ngoài."""
+        if len(data) < 16:
+            return 0.0, 0.0
+        bits = self._bits(data)
+        state = list(bits)
+        density_history = []
+        for _ in range(8):
+            state = [state[(i - 1) % len(state)] ^ (state[i] | state[(i + 1) % len(state)]) for i in range(len(state))]
+            density_history.append(sum(state) / len(state))
+        tai = xiu = 0.0
+        avg_density = sum(density_history) / len(density_history)
+        if avg_density > 0.52:
+            tai += 18.0
+        elif avg_density < 0.48:
+            xiu += 18.0
+        if density_history[-1] > density_history[0]:
+            tai += 8.0
+        else:
+            xiu += 8.0
+        return tai, xiu
+
+    def _source_ultimate_md5_core(self, data):
+        """Lõi ultimate_md5_core_v4 đã tách riêng khỏi các tính năng VIP khác."""
+        if len(data) < 16:
+            return 0.0, 0.0, []
+        import math
+        tai = xiu = 0.0
+        details = []
+        nibbles = [(b >> 4) & 0xF for b in data] + [b & 0xF for b in data]
+        high_nib = sum(1 for nib in nibbles if nib >= 8)
+        low_nib = len(nibbles) - high_nib
+        if high_nib > low_nib * 1.15:
+            tai += 15.0; details.append('v4-high-nibble→Tài')
+        elif low_nib > high_nib * 1.15:
+            xiu += 15.0; details.append('v4-low-nibble→Xỉu')
+        even_nib = sum(1 for nib in nibbles if nib % 2 == 0)
+        odd_nib = len(nibbles) - even_nib
+        if even_nib > odd_nib * 1.2:
+            xiu += 8.0
+        elif odd_nib > even_nib * 1.2:
+            tai += 8.0
+
+        byte_counts = Counter(data)
+        entropy = 0.0
+        for count in byte_counts.values():
+            p = count / n
+            if p > 0:
+                entropy -= p * math.log2(p)
+        max_entropy = math.log2(min(256, n))
+        entropy_ratio = entropy / max_entropy if max_entropy else 0.0
+        if entropy_ratio > 0.96:
+            if data[-1] >= 128: tai += 18.0
+            else: xiu += 18.0
+        elif entropy_ratio < 0.85:
+            if sum(data) / n > 128: xiu += 18.0
+            else: tai += 18.0
+
+        bits = self._bits(data)
+        ones = sum(bits); zeros = len(bits) - ones
+        if ones > zeros + 10: xiu += 12.0
+        elif zeros > ones + 10: tai += 12.0
+        runs = []; run = 1
+        for i in range(1, len(bits)):
+            if bits[i] == bits[i - 1]: run += 1
+            else: runs.append(run); run = 1
+        runs.append(run)
+        avg_run = sum(runs) / len(runs)
+        if avg_run > 2.5: tai += 10.0
+        elif avg_run < 1.8: xiu += 10.0
+
+        transitions = Counter()
+        for i in range(len(nibbles) - 2):
+            pair = (nibbles[i] >= 8, nibbles[i + 1] >= 8)
+            transitions[(pair, nibbles[i + 2] >= 8)] += 1
+        last_pair = (nibbles[-2] >= 8, nibbles[-1] >= 8)
+        if transitions[(last_pair, True)] > transitions[(last_pair, False)]:
+            tai += 20.0
+        elif transitions[(last_pair, False)] > transitions[(last_pair, True)]:
+            xiu += 20.0
+
+        spectral_tai, spectral_xiu = self._source_spectral_density(data)
+        cellular_tai, cellular_xiu = self._source_cellular_rule30(data)
+        tai += spectral_tai + cellular_tai
+        xiu += spectral_xiu + cellular_xiu
+        if tai > xiu + 5:
+            details.append('v4-core→Tài')
+        elif xiu > tai + 5:
+            details.append('v4-core→Xỉu')
+        return tai, xiu, details
+
+    def analyze(self, value):
+        raw = re.sub(r"\s+", "", value or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{32}|[0-9a-f]{64}", raw):
+            return {"ok": False, "error": "Mã phải là MD5 32 ký tự hoặc SHA-256 64 ký tự hệ hex."}
+        data = bytes.fromhex(raw)
+        bits = self._bits(data)
+        score_tai = 50.0
+        score_xiu = 50.0
+        details = []
+
+        # Bổ sung lõi dự đoán v4 từ md5bot.py; không thay đổi các luồng
+        # key, nạp tiền, tài khoản hoặc quản trị của bot hiện tại.
+        v4_tai, v4_xiu, v4_details = self._source_ultimate_md5_core(data)
+        score_tai += v4_tai
+        score_xiu += v4_xiu
+        details.extend(v4_details)
+
+        # 1. Nibble/high-low score, lấy trực tiếp tinh thần ultimate_md5_core_v4.
+        nibbles = [(b >> 4) & 15 for b in data] + [b & 15 for b in data]
+        high = sum(1 for n in nibbles if n >= 8)
+        low = len(nibbles) - high
+        if high > low * 1.15:
+            score_tai += 8; details.append("high-nibble→Tài")
+        elif low > high * 1.15:
+            score_xiu += 8; details.append("low-nibble→Xỉu")
+
+        odd = sum(n % 2 for n in nibbles)
+        even = len(nibbles) - odd
+        if odd > even * 1.20:
+            score_tai += 5
+        elif even > odd * 1.20:
+            score_xiu += 5
+
+        # 2. Shannon entropy và phân bố byte.
+        ent = self._entropy(data)
+        ratio = ent / 8.0
+        if ratio > 0.90:
+            (score_tai if data[-1] >= 128 else score_xiu)
+            if data[-1] >= 128: score_tai += 6
+            else: score_xiu += 6
+            details.append("entropy-cao")
+        elif ratio < 0.70:
+            if sum(data) / len(data) >= 128: score_xiu += 6
+            else: score_tai += 6
+            details.append("entropy-thap")
+
+        # 3. Bit ratio và độ dài run.
+        ones = sum(bits); zeros = len(bits) - ones
+        if zeros > ones + 10: score_tai += 6
+        elif ones > zeros + 10: score_xiu += 6
+        runs = []
+        run = 1
+        for i in range(1, len(bits)):
+            if bits[i] == bits[i - 1]: run += 1
+            else: runs.append(run); run = 1
+        runs.append(run)
+        avg_run = sum(runs) / max(1, len(runs))
+        if avg_run > 2.5: score_tai += 5
+        elif avg_run < 1.8: score_xiu += 5
+
+        # 4. Markov 2-step trên chuỗi nibble cao/thấp trong chính hash.
+        trans = Counter()
+        highbits = [int(n >= 8) for n in nibbles]
+        for i in range(len(highbits) - 2):
+            trans[(highbits[i], highbits[i + 1], highbits[i + 2])] += 1
+        last = tuple(highbits[-2:])
+        t = trans[(last[0], last[1], 1)]
+        x = trans[(last[0], last[1], 0)]
+        if t > x: score_tai += 7
+        elif x > t: score_xiu += 7
+
+        # 5. Fourier-like deterministic spectral score.
+        spectral = self._spectral_score(bits)
+        if spectral > 0.002: score_tai += 5; details.append("spectral→Tài")
+        elif spectral < -0.002: score_xiu += 5; details.append("spectral→Xỉu")
+
+        # 6. Cellular automaton Rule 30, cùng ý tưởng trong file mẫu.
+        state = bits[:]
+        for _ in range(8):
+            state = [state[(i - 1) % len(state)] ^ (state[i] | state[(i + 1) % len(state)]) for i in range(len(state))]
+        density = sum(state) / len(state)
+        if density > 0.52: score_tai += 5
+        elif density < 0.48: score_xiu += 5
+
+        total = score_tai + score_xiu
+        tai = round(score_tai / total * 100, 1)
+        xiu = round(score_xiu / total * 100, 1)
+        result = "Tài" if tai >= xiu else "Xỉu"
+        confidence = round(max(tai, xiu), 1)
+        return {"ok": True, "hash": raw, "result": result, "tai": tai, "xiu": xiu,
+                "confidence": confidence, "detail": ", ".join(details) or "tổng hợp deterministic"}
 
 analyzer = HashAnalyzer()
-
-# ============================================================
-# GAME CATALOG + API PHIÊN / DỰ ĐOÁN NỘI BỘ
-# ============================================================
-def sync_games_from_json():
-    """Nạp API embedded từ JSON export; file ngoài chỉ là tuỳ chọn override."""
-    ports=[x for x in BUILTIN_GAME_APIS if not ('b52' in str(x.get('slug','')).lower() and 'md5' in str(x.get('slug','')).lower())]
-    try:
-        with open(GAME_CONFIG_PATH, encoding='utf-8') as f:
-            external=json.load(f)
-        if isinstance(external,dict) and external.get('ports'): ports=external['ports']
-    except (OSError,ValueError,TypeError):
-        pass
-    emojis={'taixiu':'🎲','sicbo':'🎯','baccarat':'🃏'}; changed=0
-    with db() as c:
-        for p in ports:
-            if not isinstance(p,dict): continue
-            slug=str(p.get('slug','')).strip().lower()
-            if not slug: continue
-            cat={'taixiu':'tx','sicbo':'sicbo','baccarat':'baccarat'}.get(str(p.get('cat','taixiu')).lower(),'tx')
-            name=str(p.get('name') or slug).strip(); api=str(p.get('api_url') or '').strip()
-            mode='md5' if 'md5' in slug or 'md5' in name.lower() else 'api'
-            emoji=emojis.get(cat,'🎮')
-            c.execute("INSERT INTO games(slug,name,category,emoji,api_url,mode,enabled,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET name=excluded.name,category=excluded.category,api_url=excluded.api_url,mode=excluded.mode,enabled=excluded.enabled",(slug,name,cat,emoji,api,mode,1 if int(p.get('enabled',1)) else 0,iso(now())))
-            changed+=1
-    return changed
-def game_rows(category=None):
-    with db() as c:
-        if category:
-            return c.execute("SELECT * FROM games WHERE enabled=1 AND category=? ORDER BY name", (category,)).fetchall()
-        return c.execute("SELECT * FROM games WHERE enabled=1 ORDER BY category,name").fetchall()
-
-def game_by_slug(slug):
-    with db() as c: return c.execute("SELECT * FROM games WHERE slug=? AND enabled=1", (slug,)).fetchone()
-
-def _deep_items(value):
-    if isinstance(value, list):
-        for item in value:
-            if isinstance(item, dict): yield item
-            yield from _deep_items(item)
-    elif isinstance(value, dict):
-        for item in value.values(): yield from _deep_items(item)
-
-def api_sessions(url):
-    if not url: return [], 'API chưa được cấu hình'
-    try:
-        r=requests.get(url,timeout=10,headers={'Accept':'application/json','User-Agent':'MD5TX-Bot/2.0'}); r.raise_for_status(); data=r.json()
-    except Exception as exc:
-        log.warning('game api error: %s', exc)
-        with SESSION_CACHE_LOCK: cached=SESSION_CACHE.get(url,{}).get('sessions',[])
-        return cached, ('API đang lỗi; đang dùng dữ liệu phiên gần nhất' if cached else 'API không phản hồi hoặc JSON không hợp lệ')
-    out=[]; candidates=data if isinstance(data,list) else list(_deep_items(data))
-    for row in candidates:
-        sid=next((row.get(k) for k in ('sid','session','sessionId','phien','id','round','issueId') if row.get(k) not in (None,'')),0)
-        total=next((row.get(k) for k in ('total','sum','score','tong','point','DiceSum') if row.get(k) not in (None,'')),None)
-        result=next((row.get(k) for k in ('res','result','ket_qua','ketqua','tx','type','BetSide') if row.get(k) not in (None,'')),'')
-        dice=next((row.get(k) for k in ('dice','dices','xucxac','xuc_xac') if isinstance(row.get(k),list) and len(row.get(k))>=3),[])
-        if total is None and len(dice)>=3 and all(str(x).isdigit() for x in dice[:3]): total=sum(map(int,dice[:3]))
-        text=str(result).lower()
-        if 'tài' in text or 'tai' in text or text in ('t','big','0'): side='T'
-        elif 'xỉu' in text or 'xiu' in text or text in ('x','small','1'): side='X'
-        elif str(total).isdigit(): side='T' if int(total)>=11 else 'X'
-        else: continue
-        try: sid=int(str(sid).split('.')[0])
-        except Exception: sid=0
-        out.append({'sid':sid,'total':int(total or 0),'res':side,'dice':dice[:3]})
-    unique={}
-    for row in out:
-        if row['sid'] not in unique or unique[row['sid']]['total']==0: unique[row['sid']]=row
-    out=sorted(unique.values(),key=lambda x:x['sid'],reverse=True)[:120]
-    with SESSION_CACHE_LOCK: SESSION_CACHE[url]={'sessions':out,'sid':out[0]['sid'] if out else 0,'updated':time.time()}
-    return out,'' if out else 'API chưa có lịch sử phiên hợp lệ'
-
-def refresh_all_api_sessions():
-    """Polling nền: mỗi chu kỳ gọi lại API game và lưu phiên mới vào cache."""
-    while True:
-        try:
-            with db() as c: urls=[r['api_url'] for r in c.execute("SELECT api_url FROM games WHERE enabled=1 AND COALESCE(locked,0)=0 AND COALESCE(maintenance,0)=0 AND api_url<>''").fetchall()]
-            with ThreadPoolExecutor(max_workers=min(6,max(1,len(urls)))) as pool: list(pool.map(api_sessions,urls))
-        except Exception: log.exception('auto api refresh error')
-        time.sleep(AUTO_REFRESH_SECONDS)
-def game_keyboard(category):
-    k = types.InlineKeyboardMarkup(row_width=2)
-    for g in game_rows(category): k.add(types.InlineKeyboardButton(f"{g['emoji']} {g['name']}", callback_data='game:'+g['slug']))
-    k.add(types.InlineKeyboardButton('↩️ Chọn loại khác', callback_data='play'), types.InlineKeyboardButton('🏠 Trang chủ', callback_data='home'))
-    return k
 
 # ============================================================
 # GIAO DIỆN TELEGRAM — chuyển trang bằng edit_message_text
@@ -436,8 +549,6 @@ def callbacks(call):
         elif call.data == "packages": show_packages(cid, call)
         elif call.data == "deposit": ask_deposit(cid, call)
         elif call.data == "play": play(cid, call)
-        elif call.data.startswith("cat:"): choose_game(cid, call.data.split(":",1)[1], call)
-        elif call.data.startswith("game:"): choose_game_detail(cid, call.data.split(":",1)[1], call)
         elif call.data == "enter_key":
             edit_page(call, "🔐 <b>Nhập key</b>\n\nHãy gửi key của bạn trong tin nhắn tiếp theo.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Quay lại", callback_data="home")))
             bot.register_next_step_handler_by_chat_id(cid, activate_key)
@@ -455,7 +566,7 @@ def callbacks(call):
         elif call.data.startswith("approve_confirm:"): decide_deposit(uid, int(call.data.split(":")[1]), True)
         elif call.data.startswith("reject:"): request_reject(uid, int(call.data.split(":")[1]), call)
         elif call.data.startswith("reject_confirm:"): decide_deposit(uid, int(call.data.split(":")[1]), False)
-        elif call.data == "admin_key": edit_page(call, "🔑 <b>Tạo key</b>\n\nDùng lệnh <code>/taokey số_ngày số_lượng</code>, ví dụ <code>/taokey 30 10</code>.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
+        elif call.data == "admin_key": edit_page(call, "🔑 <b>Tạo key</b>\n\nDùng lệnh <code>/taokey Tên_gói</code> để tạo key.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
         elif call.data == "admin_stats": send_stats(cid, call)
         elif call.data == "admin_broadcast":
             edit_page(call, "📢 <b>THÔNG BÁO TOÀN BỘ</b>\n\nHãy nhập nội dung thông báo ở tin nhắn kế tiếp.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
@@ -596,95 +707,43 @@ def show_contact(cid, call=None):
 def play(cid, call=None):
     row = user_key(cid)
     if not row:
-        text = "🔒 <b>KHU VỰC DỰ ĐOÁN</b>\n\nBạn chưa có key còn hạn. Hãy nhập key hoặc mua gói để tiếp tục."
+        text = "🔒 <b>KHU VỰC CHƠI</b>\n\nBạn chưa có key còn hạn. Hãy nhập key hoặc mua gói để tiếp tục."
         k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔐 Nhập key", callback_data="enter_key"), types.InlineKeyboardButton("💎 Mua gói", callback_data="packages"))
     else:
-        text = "🎮 <b>CHỌN LOẠI GAME</b>\n\nChọn TX, Sicbo hoặc Baccarat để tiếp tục."
-        k = types.InlineKeyboardMarkup(row_width=3)
-        k.add(types.InlineKeyboardButton('🎲 Tài Xỉu', callback_data='cat:tx'), types.InlineKeyboardButton('🎯 Sicbo', callback_data='cat:sicbo'), types.InlineKeyboardButton('🃏 Baccarat', callback_data='cat:baccarat'))
-        k.add(types.InlineKeyboardButton('🏠 Trang chủ', callback_data='home'))
+        text = f"🎮 <b>SẴN SÀNG PHÂN TÍCH</b>\n\nKey còn hạn đến: <code>{row['expires_at']}</code>\n\nGửi mã MD5 32 ký tự hoặc SHA-256 64 ký tự."
+        k = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 Trang chủ", callback_data="home"))
     if call: edit_page(call, text, k)
     else: bot.send_message(cid, text, reply_markup=k)
+    if row: bot.register_next_step_handler_by_chat_id(cid, analyze_message)
 
-def choose_game(cid, category, call=None):
-    labels = {'tx':'🎲 DANH SÁCH TÀI XỈU','sicbo':'🎯 DANH SÁCH SICBO','baccarat':'🃏 DANH SÁCH BACCARAT'}
-    text = labels.get(category, '🎮 DANH SÁCH GAME') + '\n\nChọn game cần phân tích:'
-    if call: edit_page(call, text, game_keyboard(category))
-    else: bot.send_message(cid, text, reply_markup=game_keyboard(category))
-
-def _api_result_text(g, sessions, out):
-    if not out.get('ok'):
-        return f"{g['emoji']} <b>{html.escape(g['name'])}</b>\n\n📡 Trạng thái dữ liệu: <b>{'Đang dùng lịch sử gần nhất' if sessions else 'Chưa đồng bộ được'}</b>\n\n⚠️ {html.escape(out.get('error','API chưa trả dữ liệu hợp lệ'))}"
-    label='TÀI' if out['pick']=='T' else 'XỈU'
-    hist=' · '.join(str(x) for x in out.get('history',[])[:12])
-    return (f"{g['emoji']} <b>{html.escape(g['name'])}</b>\n\n"
-            f"📡 Trạng thái dữ liệu: <b>Đã cập nhật tự động</b>\n"
-            f"📌 Phiên: <code>{out.get('sid') or '—'}</code>\n"
-            f"🔮 Phiên dự đoán: <code>{out.get('next') or '—'}</code>\n"
-            f"🎯 Dự đoán: <b>{label}</b>\n"
-            f"📊 Tỉ Lệ: <b>{out.get('conf',50)}%</b>\n"
-            f"📚 Lịch sử: <code>{html.escape(hist or 'chưa có')}</code>")
-
-def _api_predict(cid, slug, call=None):
-    g=game_by_slug(slug)
-    if not g or not g['api_url']:
-        text='⚠️ Game chưa có API phiên hoặc API chưa trả dữ liệu.'
-        return edit_page(call,text,types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('↩️ Chọn game khác',callback_data='cat:'+g['category'] if g else 'play'))) if call else bot.send_message(cid,text)
-    sessions,err=api_sessions(g['api_url']); out=predict_sessions(sessions)
-    if not out.get('ok') and err: out['error']=err
-    k=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('🔄 Cập nhật phiên',callback_data='api:'+slug),types.InlineKeyboardButton('🔐 Nhập mã MD5',callback_data='hash:'+slug))
-    k.add(types.InlineKeyboardButton('↩️ Chọn game khác',callback_data='cat:'+g['category']),types.InlineKeyboardButton('🏠 Trang chủ',callback_data='home'))
-    text=_api_result_text(g,sessions,out)
-    edit_page(call,text,k) if call else bot.send_message(cid,text,reply_markup=k)
-
-def choose_game_detail(cid, slug, call=None):
-    if not user_key(cid): bot.send_message(cid,'🔒 Key đã hết hạn hoặc chưa kích hoạt.'); return
-    g=game_by_slug(slug)
-    if not g or int(g['locked'] or 0) or int(g['maintenance'] or 0):
-        bot.send_message(cid,'🛠️ Cổng game đang khóa hoặc bảo trì.'); return
-    # Mọi game có API đều được phân tích bằng API; MD5 chỉ là tùy chọn bổ sung.
-    if g['api_url']:
-        if g['mode']=='md5':
-            k=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('📡 Dự đoán theo API phiên',callback_data='api:'+slug),types.InlineKeyboardButton('🔐 Dự đoán bằng mã MD5',callback_data='hash:'+slug))
-            k.add(types.InlineKeyboardButton('↩️ Chọn game khác',callback_data='cat:'+g['category']),types.InlineKeyboardButton('🏠 Trang chủ',callback_data='home'))
-            text=f"{g['emoji']} <b>{html.escape(g['name'])}</b>\n\n📡 Game có API phiên. Chọn cách dự đoán:\n\n• API phiên: tự lấy phiên và lịch sử mới nhất.\n• Mã MD5: chỉ khi bạn muốn tự nhập mã MD5/SHA-256."
-            edit_page(call,text,k) if call else bot.send_message(cid,text,reply_markup=k)
-        else: _api_predict(cid,slug,call)
-        return
-    k=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('↩️ Chọn game khác',callback_data='cat:'+g['category']),types.InlineKeyboardButton('🏠 Trang chủ',callback_data='home'))
-    text=f"{g['emoji']} <b>{html.escape(g['name'])}</b>\n\n🔐 Game chưa có API. Gửi mã MD5 32 ký tự hoặc SHA-256 64 ký tự để phân tích."
-    edit_page(call,text,k) if call else bot.send_message(cid,text,reply_markup=k)
-    bot.register_next_step_handler_by_chat_id(cid,analyze_message)
 
 def analyze_message(message):
-    if (message.text or '').strip().lower() in ('/start','/menu','/help'):
+    if (message.text or "").strip().lower() in ("/start", "/menu"):
         try: bot.clear_step_handler_by_chat_id(message.chat.id)
         except Exception: pass
         register_user(message); welcome(message.chat.id); return
     if not user_key(message.chat.id):
-        bot.send_message(message.chat.id, '🔒 Key đã hết hạn hoặc chưa được kích hoạt.'); return
-    try: out = analyzer.analyze(message.text or '')
-    except Exception:
-        log.exception('hash analyzer error'); bot.send_message(message.chat.id, '⚠️ Không thể phân tích mã này.'); bot.register_next_step_handler_by_chat_id(message.chat.id, analyze_message); return
-    if not out['ok']:
-        bot.send_message(message.chat.id, '❌ '+out['error']+'\n\n🔁 Hãy gửi lại mã hợp lệ.'); bot.register_next_step_handler_by_chat_id(message.chat.id, analyze_message); return
-    digest = out['hash'].upper(); nums = [int(digest[i:i+2], 16) % 6 + 1 for i in (0,2,4)]; total=sum(nums)
-    verdict = '🅣 TÀI' if out['result']=='Tài' else '🅧 XỈU'
-    text = (f"🔮 <b>PHÂN TÍCH MD5 TÀI/XỈU</b>\n\n📝 Hash: <code>{digest[:8]}...{digest[-8:]}</code>\n"
-            f"🎲 Bộ số tham khảo: <b>{nums[0]}-{nums[1]}-{nums[2]}</b> | Tổng: <b>{total}</b>\n"
-            f"📉 Kết luận: <b>{verdict}</b>\n🎯 Tỉ Lệ: <b>T {out['tai']}% · X {out['xiu']}%</b>\n\n"
-            '⚠️ Hash ngẫu nhiên không chứa thông tin bảo đảm kết quả game.')
-    bot.send_message(message.chat.id, text); bot.register_next_step_handler_by_chat_id(message.chat.id, analyze_message)
-
-
-@bot.message_handler(func=lambda message: bool(message.text) and not message.text.startswith("/"))
-def direct_hash_message(message):
-    """Cho phép gửi MD5/SHA trực tiếp mà không bắt buộc phải bấm Chơi ngay trước."""
-    text = re.sub(r"\s+", "", message.text or "")
-    if re.fullmatch(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{64}", text):
-        analyze_message(message)
-    else:
-        bot.send_message(message.chat.id, "ℹ️ Hãy bấm Chơi ngay rồi gửi mã MD5 32 ký tự hoặc SHA-256 64 ký tự.")
+        bot.send_message(message.chat.id, "🔒 Key đã hết hạn hoặc chưa được kích hoạt.")
+        return
+    out = analyzer.analyze(message.text)
+    if not out["ok"]:
+        bot.send_message(message.chat.id, "❌ " + out["error"] + "\n\n🔁 Hãy gửi lại mã MD5/SHA hợp lệ.")
+        bot.register_next_step_handler_by_chat_id(message.chat.id, analyze_message)
+        return
+    digest = out['hash'].upper()
+    short = digest[:8] + "..." + digest[-8:]
+    nums = [int(digest[i:i+2], 16) % 6 + 1 for i in (0, 2, 4)]
+    total = sum(nums)
+    verdict = "🅣 TÀI" if out['result'] == "Tài" else "🅧 XỈU"
+    text = (f"🔮 <b>PHÂN TÍCH MD5 TÀI/XỈU</b>\n\n"
+            f"📦 Phiên bản: <b>Mới Nhất</b>\n"
+            f"📝 MD5 hiện tại: <code>{short}</code>\n\n"
+            f"🎲 Bộ số mô phỏng: <b>{nums[0]}-{nums[1]}-{nums[2]}</b> | Tổng: <b>{total}</b>\n"
+            f"📉 Kết luận: <b>{verdict}</b>\n"
+            f"🎯 Tài/Xỉu %: <b>T {out['tai']}% · X {out['xiu']}%</b>")
+    bot.send_message(message.chat.id, text)
+    # Giữ phiên chơi mở: user có thể gửi mã tiếp theo ngay lập tức.
+    bot.register_next_step_handler_by_chat_id(message.chat.id, analyze_message)
 
 
 def show_account(cid, call=None):
@@ -757,19 +816,17 @@ def admin_cmd(message):
 @bot.message_handler(commands=["taokey"])
 def create_key_cmd(message):
     if not is_admin(message.from_user.id): return
-    parts = (message.text or '').split()
-    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
-        bot.send_message(message.chat.id, '❌ Cú pháp đúng: <code>/taokey số_ngày số_lượng</code>\nVí dụ: <code>/taokey 30 10</code>'); return
-    days, qty = max(1,int(parts[1])), min(500,max(1,int(parts[2])))
-    created=[]
+    name = " ".join((message.text or "").split()[1:]).replace("_", " ").strip()
+    packages = get_setting("packages", DEFAULT_PACKAGES)
+    if name not in packages:
+        bot.send_message(message.chat.id, "Tên gói không đúng. Gói hiện có: " + ", ".join(packages)); return
+    p = packages[name]
     with db() as c:
-        for _ in range(qty):
-            seed=f'{BOT_TOKEN}:{message.from_user.id}:{days}:{time.time_ns()}:{len(created)}'.encode()
-            key='TX-'+hashlib.sha256(seed).hexdigest()[:20].upper()
-            c.execute('INSERT INTO keys(key,package_name,days,created_at) VALUES(?,?,?,?)',(key,f'Key {days} ngày',days,iso(now())))
-            created.append(key)
-    bot.send_message(message.chat.id, f'✅ <b>TẠO KEY THÀNH CÔNG</b>\n\n⏳ Thời hạn: <b>{days} ngày</b>\n📦 Số lượng: <b>{qty}</b>\n\n'+'\n'.join(f'<code>{x}</code>' for x in created))
-
+        count = c.execute("SELECT COUNT(*) n FROM keys").fetchone()["n"] + 1
+    seed = f"{BOT_TOKEN}:{message.from_user.id}:{name}:{count}:{time.time_ns()}".encode()
+    key = "TX-" + hashlib.sha256(seed).hexdigest()[:20].upper()
+    with db() as c: c.execute("INSERT INTO keys(key,package_name,days,created_at) VALUES(?,?,?,?)", (key, name, p["days"], iso(now())))
+    bot.send_message(message.chat.id, f"Đã tạo key cho <b>{html.escape(name)}</b>:\n<code>{key}</code>")
 
 @bot.message_handler(commands=["taogift"])
 def create_gift_cmd(message):
@@ -885,7 +942,7 @@ ADMIN_HTML = """
 <!doctype html><html lang='vi'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{{bot_name}} · Admin</title>
 <style>
 :root{--bg:#080d1c;--panel:#111a2e;--panel2:#16223a;--line:#263756;--text:#f4f7fb;--muted:#92a4c4;--blue:#4f7cff;--cyan:#27d3c2;--green:#31d18b;--orange:#ffb454;--red:#ff6b7a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% 0,#1c3262 0,transparent 34%),var(--bg);color:var(--text);font:14px Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.shell{display:flex;min-height:100vh}.side{width:245px;background:rgba(7,12,27,.86);border-right:1px solid var(--line);padding:25px 16px}.brand{display:flex;gap:12px;align-items:center;font-weight:800;font-size:16px;margin-bottom:35px}.logo{width:40px;height:40px;border-radius:13px;background:linear-gradient(135deg,var(--blue),var(--cyan));display:grid;place-items:center;font-weight:900}.nav{display:grid;gap:7px}.nav a{color:var(--muted);text-decoration:none;padding:12px 13px;border-radius:10px}.nav a:hover,.nav a.active{background:#182846;color:white}.content{flex:1;padding:28px 4.5vw 55px;max-width:1500px}.top{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:25px}.eyebrow{color:var(--cyan);text-transform:uppercase;letter-spacing:1.8px;font-size:11px;font-weight:800}.top h1{font-size:30px;margin:7px 0}.muted{color:var(--muted)}.notice{background:#302719;border:1px solid #725a31;color:#ffd990;padding:12px 15px;border-radius:12px;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.card,section{background:linear-gradient(145deg,rgba(22,34,58,.95),rgba(14,23,42,.95));border:1px solid var(--line);border-radius:16px;padding:19px;box-shadow:0 14px 35px #0002}.stat{font-size:28px;font-weight:800;margin:7px 0}.label{color:var(--muted);font-size:12px}.accent{color:var(--cyan)}.row{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}section h2{font-size:17px;margin:0 0 17px}label{display:block;color:var(--muted);font-size:12px;margin:11px 0 5px}input,textarea,select{width:100%;border:1px solid var(--line);border-radius:9px;background:#0c1529;color:var(--text);padding:11px 12px;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--blue)}button{border:0;border-radius:9px;background:linear-gradient(135deg,#4f7cff,#3560df);color:#fff;padding:11px 16px;font-weight:700;cursor:pointer;margin-top:14px}button:hover{filter:brightness(1.12)}.btn-green{background:linear-gradient(135deg,#20bd7a,#179c68)}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:12px 9px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-weight:600}.pill{display:inline-block;padding:5px 9px;border-radius:99px;font-size:11px;font-weight:700}.pending{background:#49391b;color:#ffd47c}.approved{background:#153e32;color:#67e5ae}.rejected{background:#472631;color:#ff9aa6}code{color:#8fe9ff;background:#0b1427;padding:3px 6px;border-radius:5px}.footer{color:#647594;font-size:12px;margin-top:18px}@media(max-width:900px){.side{width:190px}.grid{grid-template-columns:repeat(2,1fr)}.row{grid-template-columns:1fr}}@media(max-width:620px){.shell{display:block}.side{width:100%;border-right:0;border-bottom:1px solid var(--line);padding:16px}.brand{margin-bottom:12px}.nav{display:flex;overflow:auto}.content{padding:22px 15px}.grid{grid-template-columns:1fr 1fr}.top{display:block}}
-.button-link{display:inline-flex;align-items:center;padding:11px 14px;border-radius:9px;background:linear-gradient(135deg,#4f7cff,#3560df);color:#fff;text-decoration:none;font-weight:700}.button-link:hover{filter:brightness(1.12)}.shop-form{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:10px;align-items:end;margin-top:16px}.inline-edit{display:grid;grid-template-columns:repeat(3,minmax(100px,1fr)) auto;gap:6px;min-width:520px;padding:10px;background:#0c1529;border:1px solid var(--line);border-radius:10px}.inline-edit input,.inline-edit select{padding:8px}.inline-edit button{margin:0;padding:8px 12px}.shop-form button{margin:0}details summary{cursor:pointer;color:var(--cyan);font-weight:700;display:inline-block;padding:5px} @media(max-width:700px){.shop-form{grid-template-columns:1fr}.inline-edit{grid-template-columns:1fr;min-width:240px}}</style></head><body><div class='shell'><aside class='side'><div class='brand'><div class='logo'>TX</div><div>{{bot_name}}<div class='muted' style='font-size:11px;margin-top:3px'>CONTROL CENTER</div></div></div><nav class='nav'><a class='active' href='#overview'>▦ Tổng quan</a><a href='#runtime'>⚙ Cấu hình bot</a><a href='#bank'>◈ VietQR & ngân hàng</a><a href='#packages'>◇ Gói key</a><a href='#giftcodes'>🎁 Giftcode</a><a href='#backup'>💾 Backup</a><a href='#deposits'>⇄ Đơn nạp</a><a href='#users'>👥 Người dùng</a><a href='#keys'>✦ Tạo key</a></nav></aside><main class='content'><header class='top'><div><div class='eyebrow'>Management dashboard</div><h1>Xin chào, quản trị viên</h1><div class='muted'>Quản lý bot, giao dịch và key trong một nơi.</div></div><div class='pill {{"approved" if bot_ready else "pending"}}'>● {{'BOT ĐANG CHẠY' if bot_ready else 'CHỜ CẤU HÌNH BOT'}}</div></header><div class='notice'><b>Lưu ý bảo mật:</b> giao diện này không có đăng nhập theo yêu cầu ban đầu. Không chia sẻ URL admin công khai.</div><section id='backup' class='card' style='margin-bottom:18px'><h2>💾 Backup & khôi phục dữ liệu</h2><div class='muted'>Backup đầy đủ users, keys, giao dịch, giftcode, cấu hình và game hiện tại. Khi update bot, tải file JSON backup lên để giữ dữ liệu.</div><div style='display:flex;gap:10px;flex-wrap:wrap;margin-top:12px'><a href='/admin/backup' class='button-link'>⬇️ Tải backup ZIP đầy đủ</a><a href='/admin/backup/json' class='button-link'>⬇️ Tải backup JSON</a><form method='post' action='/admin/restore' enctype='multipart/form-data' style='display:flex;gap:8px;flex-wrap:wrap;align-items:center'><input type='file' name='backup_file' accept='.json,.zip' required><button class='btn-green' style='margin:0'>⬆️ Nhập JSON khôi phục</button></form></div></section><div id='overview' class='grid'><div class='card'><div class='label'>NGƯỜI DÙNG</div><div class='stat'>{{stats.users}}</div><div class='muted'>tài khoản đã đăng ký</div></div><div class='card'><div class='label'>KEY CHƯA DÙNG</div><div class='stat accent'>{{stats.unused_keys}}</div><div class='muted'>sẵn sàng cấp</div></div><div class='card'><div class='label'>ĐƠN CHỜ DUYỆT</div><div class='stat' style='color:var(--orange)'>{{stats.pending}}</div><div class='muted'>cần kiểm tra</div></div><div class='card'><div class='label'>DOANH THU ĐÃ DUYỆT</div><div class='stat' style='color:var(--green)'>{{stats.revenue}}</div><div class='muted'>tổng tiền nạp</div></div></div><div id='runtime' class='row'><section><h2>⚙ Cấu hình bot</h2><form method='post' action='/admin/runtime'><label>Bot Token từ BotFather</label><input type='password' name='bot_token' placeholder='Dán token có dạng 123456:AA...' value='{{token_value}}'><label>Telegram ID admin</label><input name='admin_ids' placeholder='Ví dụ: 123456789,987654321' value='{{admin_ids}}'><button class='btn-green'>Lưu & khởi động bot</button></form></section><section id='bank'><h2>◈ Tài khoản nhận tiền</h2><form method='post' action='/admin/bank'><label>Mã ngân hàng</label><input name='bank_code' value='{{bank.bank_code}}'><label>Số tài khoản</label><input name='account_no' value='{{bank.account_no}}'><label>Tên chủ tài khoản</label><input name='account_name' value='{{bank.account_name}}'><label>Tiền tố nội dung</label><input name='note_prefix' value='{{bank.note_prefix}}'><label>Link liên hệ admin</label><input name='contact_link' type='url' placeholder='https://t.me/ten_admin' value='{{bank.contact_link}}'><button>Lưu thông tin VietQR & liên hệ</button></form></section></div><section id='packages'><h2>◇ Quản lý gói key</h2><div class='muted'>Nhập tên gói, giá tiền và số ngày rồi bấm thêm. Không cần sửa JSON.</div><form method='post' action='/admin/package/add' style='display:grid;grid-template-columns:1.3fr 1fr 1fr auto;gap:10px;align-items:end'><div><label>Tên gói</label><input name='name' placeholder='Ví dụ: Gói VIP 7 ngày' required></div><div><label>Giá tiền</label><input name='price' type='number' min='0' placeholder='50000' required></div><div><label>Số ngày</label><input name='days' type='number' min='1' placeholder='7' required></div><button>＋ Thêm gói</button></form><div style='overflow:auto;margin-top:18px'><table><tr><th>Tên gói</th><th>Giá</th><th>Thời hạn</th><th></th></tr>{% for n,p in packages.items() %}<tr><td><b>{{n}}</b></td><td>{{p.price}}</td><td>{{p.days}} ngày</td><td><details><summary>✏️ Sửa</summary><form method='post' action='/admin/package/edit' class='inline-edit'><input type='hidden' name='old_name' value='{{n}}'><input name='name' value='{{n}}' required><input name='price' type='number' min='0' value='{{p.price}}' required><input name='days' type='number' min='1' value='{{p.days}}' required><button>Lưu</button></form></details> <form method='post' action='/admin/package/delete' style='display:inline'><input type='hidden' name='name' value='{{n}}'><button style='background:linear-gradient(135deg,#e65b6e,#b7354b);margin:0'>Xóa</button></form></td></tr>{% else %}<tr><td colspan='4' class='muted'>Chưa có gói.</td></tr>{% endfor %}</table></div></section><section id='games' style='margin-top:18px'><h2>🎮 Game & API phiên</h2><div class='muted'>Nhập API phiên; bot sẽ dùng dữ liệu này để hiển thị Phiên, phiên kế tiếp và dự đoán nội bộ. Không cần API dự đoán.</div><form method='post' action='/admin/game/add' style='display:grid;grid-template-columns:1fr 1fr 1fr 1.8fr auto;gap:10px;align-items:end'><div><label>Tên game</label><input name='name' placeholder='Ví dụ: Sunwin TX' required></div><div><label>Slug</label><input name='slug' placeholder='sunwin-tx' required></div><div><label>Loại</label><select name='category'><option value='tx'>Tài Xỉu</option><option value='sicbo'>Sicbo</option><option value='baccarat'>Baccarat</option></select></div><div><label>API phiên</label><input name='api_url' type='url' placeholder='https://...'></div><button>＋ Lưu game</button></form><div style='overflow:auto;margin-top:18px'><table><tr><th>Game</th><th>Loại</th><th>Chế độ</th><th>API phiên</th><th></th></tr>{% for g in games %}<tr><td>{{g.emoji}} <b>{{g.name}}</b></td><td>{{g.category}}</td><td>{{g.mode}}</td><td><code>{{g.api_url or 'chưa cấu hình'}}</code></td><td><details><summary>✏️ Sửa</summary><form method='post' action='/admin/game/edit' class='inline-edit'><input type='hidden' name='slug' value='{{g.slug}}'><input name='name' value='{{g.name}}' required><select name='category'><option value='tx' {% if g.category=='tx' %}selected{% endif %}>TX</option><option value='sicbo' {% if g.category=='sicbo' %}selected{% endif %}>Sicbo</option><option value='baccarat' {% if g.category=='baccarat' %}selected{% endif %}>Baccarat</option></select><input name='api_url' value='{{g.api_url}}' placeholder='API phiên'><button>Lưu</button></form></details> <form method='post' action='/admin/game/delete' onsubmit="return confirm('Xóa game này?')" style='display:inline'><input type='hidden' name='slug' value='{{g.slug}}'><button style='margin:0;background:linear-gradient(135deg,#e65b6e,#b7354b)'>Xóa</button></form> <form method='post' action='/admin/game/toggle' style='display:inline'><input type='hidden' name='slug' value='{{g.slug}}'><input type='hidden' name='field' value='maintenance'><button style='margin:0;background:linear-gradient(135deg,#ffb454,#d98222)'>{{'Mở bảo trì' if g.maintenance else 'Bảo trì'}}</button></form> <form method='post' action='/admin/game/toggle' style='display:inline'><input type='hidden' name='slug' value='{{g.slug}}'><input type='hidden' name='field' value='locked'><button style='margin:0;background:linear-gradient(135deg,#8b5cf6,#6d28d9)'>{{'Mở khóa' if g.locked else 'Khóa'}}</button></form></td></tr>{% endfor %}</table></div></section><section id='giftcodes' style='margin-top:18px'><h2>🎁 Giftcode</h2><div class='muted'>Thêm, sửa, bật/tắt hoặc xóa giftcode.</div><form method='post' action='/admin/gift/add' class='shop-form'><input name='code' placeholder='WELCOME2026' required><input name='amount' type='number' min='0' placeholder='Giá trị VNĐ' required><input name='max_uses' type='number' min='1' value='1' required><button>＋ Thêm giftcode</button></form><div style='overflow:auto;margin-top:18px'><table><tr><th>Mã</th><th>Giá trị</th><th>Đã dùng</th><th>Trạng thái</th><th>Thao tác</th></tr>{% for g in giftcodes %}<tr><td><code>{{g.code}}</code></td><td>{{g.amount}}</td><td>{{g.used_count}} / {{g.max_uses}}</td><td>{{'ĐANG BẬT' if g.active else 'ĐANG TẮT'}}</td><td><details><summary>✏️ Sửa</summary><form method='post' action='/admin/gift/edit' class='inline-edit'><input type='hidden' name='old_code' value='{{g.code}}'><input name='code' value='{{g.code}}' required><input name='amount' type='number' min='0' value='{{g.amount}}' required><input name='max_uses' type='number' min='1' value='{{g.max_uses}}' required><label><input type='checkbox' name='active' {% if g.active %}checked{% endif %}> Bật</label><button>Lưu</button></form></details> <form method='post' action='/admin/gift/delete' style='display:inline' onsubmit="return confirm('Xóa giftcode này?')"><input type='hidden' name='code' value='{{g.code}}'><button style='margin:0;background:linear-gradient(135deg,#e65b6e,#b7354b)'>Xóa</button></form></td></tr>{% else %}<tr><td colspan='5' class='muted'>Chưa có giftcode.</td></tr>{% endfor %}</table></div></section><section id='deposits' style='margin-top:18px'><h2>⇄ 100 đơn nạp gần nhất</h2><div style='overflow:auto'><table><tr><th>ID</th><th>Telegram ID</th><th>Số tiền</th><th>Nội dung</th><th>Trạng thái</th><th>Thời gian</th></tr>{% for d in deposits %}<tr><td>#{{d.id}}</td><td>{{d.telegram_id}}</td><td><b>{{d.amount}}</b></td><td><code>{{d.content}}</code></td><td><span class='pill {{d.status}}'>{{d.status}}</span></td><td class='muted'>{{d.created_at[:19]}}</td></tr>{% else %}<tr><td colspan='6' class='muted'>Chưa có đơn nạp.</td></tr>{% endfor %}</table></div></section><section id='users' style='margin-top:18px'><h2>👥 Quản lý người dùng & số dư</h2><div style='overflow:auto'><table><tr><th>Telegram ID</th><th>Tên</th><th>Username</th><th>Số dư</th><th>Cộng / trừ tiền</th></tr>{% for u in users %}<tr><td><code>{{u.telegram_id}}</code></td><td>{{u.first_name}}</td><td>@{{u.username}}</td><td><b>{{u.balance}}</b></td><td><form method='post' action='/admin/user/balance' style='display:flex;gap:6px;min-width:290px'><input type='hidden' name='telegram_id' value='{{u.telegram_id}}'><input name='amount' type='number' placeholder='10000' required><button style='margin:0'>Cộng</button><button name='mode' value='subtract' style='margin:0;background:linear-gradient(135deg,#e65b6e,#b7354b)'>Trừ</button></form></td></tr>{% else %}<tr><td colspan='5' class='muted'>Chưa có user.</td></tr>{% endfor %}</table></div></section><section id='keys' style='margin-top:18px'><h2>✦ Quản lý key đang chạy</h2><div class='muted'>Key đang chạy được hiển thị đầu tiên. Khóa key sẽ ngăn kích hoạt mới và vô hiệu hóa key đang dùng; mở khóa cho phép sử dụng lại nếu còn hạn.</div><input id='keySearch' placeholder='🔎 Tìm theo key, gói hoặc Telegram ID...' style='max-width:420px;margin:12px 0'><div style='overflow:auto;margin-top:14px'><table id='keyTable'><tr><th>Key</th><th>Gói</th><th>Người dùng</th><th>Hạn dùng</th><th>Trạng thái</th><th>Thao tác</th></tr>{% for k in keys %}<tr><td><code>{{k.key}}</code></td><td>{{k.package_name}}</td><td>{% if k.used_by %}<code>{{k.used_by}}</code>{% else %}<span class='muted'>Chưa dùng</span>{% endif %}</td><td class='muted'>{{k.expires_at or '—'}}</td><td><span class='pill {{'rejected' if k.locked else ('approved' if k.used_by and k.expires_at and k.expires_at > now_iso else 'pending')}}'>{{'ĐANG KHÓA' if k.locked else ('ĐANG CHẠY' if k.used_by and k.expires_at and k.expires_at > now_iso else ('ĐÃ CẤP' if k.used_by else 'CHƯA DÙNG'))}}</span></td><td style='white-space:nowrap'><form method='post' action='/admin/key/toggle' style='display:inline'><input type='hidden' name='key' value='{{k.key}}'><button style='margin:0;background:linear-gradient(135deg,#ffb454,#d98222)'>{{'Mở khóa' if k.locked else 'Khóa'}}</button></form> <form method='post' action='/admin/key/delete' style='display:inline' onsubmit="return confirm('Xóa key này?')"><input type='hidden' name='key' value='{{k.key}}'><button style='margin:0;background:linear-gradient(135deg,#e65b6e,#b7354b)'>Xóa</button></form></td></tr>{% else %}<tr><td colspan='6' class='muted'>Chưa có key.</td></tr>{% endfor %}</table></div><div class='row' style='margin-top:18px'><section><h2>✦ Tạo key nhanh</h2><form method='post' action='/admin/key'><label>Chọn gói</label><select name='package'>{% for n in packages %}<option>{{n}}</option>{% endfor %}</select><button>Tạo key mới</button></form>{% if generated %}<div style='margin-top:18px'>Key mới: <code>{{generated}}</code></div>{% endif %}</section><section><h2>Trạng thái hệ thống</h2><div class='muted'>Health endpoint</div><p><span class='pill approved'>● ONLINE</span> <code>/</code></p><div class='muted'>Database</div><p><span class='pill approved'>● READY</span> SQLite</p></section></div><div class='footer'>{{bot_name}} · Admin Control Center · Dữ liệu được lưu trong SQLite · Hiển thị toàn bộ key</div></main></div><script>document.getElementById('keySearch')?.addEventListener('input',function(){const q=this.value.toLowerCase();document.querySelectorAll('#keyTable tr').forEach((r,i)=>{r.style.display=i===0||r.textContent.toLowerCase().includes(q)?'':'none'})});document.querySelectorAll('.nav a').forEach(a=>a.addEventListener('click',()=>document.querySelector(a.getAttribute('href'))?.scrollIntoView({behavior:'smooth'})));</script></body></html>
+</style></head><body><div class='shell'><aside class='side'><div class='brand'><div class='logo'>TX</div><div>{{bot_name}}<div class='muted' style='font-size:11px;margin-top:3px'>CONTROL CENTER</div></div></div><nav class='nav'><a class='active' href='#overview'>▦ Tổng quan</a><a href='#runtime'>⚙ Cấu hình bot</a><a href='#bank'>◈ VietQR & ngân hàng</a><a href='#packages'>◇ Gói key</a><a href='#deposits'>⇄ Đơn nạp</a><a href='#users'>👥 Người dùng</a><a href='#keys'>✦ Tạo key</a></nav></aside><main class='content'><header class='top'><div><div class='eyebrow'>Management dashboard</div><h1>Xin chào, quản trị viên</h1><div class='muted'>Quản lý bot, giao dịch và key trong một nơi.</div></div><div class='pill {{"approved" if bot_ready else "pending"}}'>● {{'BOT ĐANG CHẠY' if bot_ready else 'CHỜ CẤU HÌNH BOT'}}</div></header><div class='notice'><b>Lưu ý bảo mật:</b> giao diện này không có đăng nhập theo yêu cầu ban đầu. Không chia sẻ URL admin công khai.</div><div id='overview' class='grid'><div class='card'><div class='label'>NGƯỜI DÙNG</div><div class='stat'>{{stats.users}}</div><div class='muted'>tài khoản đã đăng ký</div></div><div class='card'><div class='label'>KEY CHƯA DÙNG</div><div class='stat accent'>{{stats.unused_keys}}</div><div class='muted'>sẵn sàng cấp</div></div><div class='card'><div class='label'>ĐƠN CHỜ DUYỆT</div><div class='stat' style='color:var(--orange)'>{{stats.pending}}</div><div class='muted'>cần kiểm tra</div></div><div class='card'><div class='label'>DOANH THU ĐÃ DUYỆT</div><div class='stat' style='color:var(--green)'>{{stats.revenue}}</div><div class='muted'>tổng tiền nạp</div></div></div><div id='runtime' class='row'><section><h2>⚙ Cấu hình bot</h2><form method='post' action='/admin/runtime'><label>Bot Token từ BotFather</label><input type='password' name='bot_token' placeholder='Dán token có dạng 123456:AA...' value='{{token_value}}'><label>Telegram ID admin</label><input name='admin_ids' placeholder='Ví dụ: 123456789,987654321' value='{{admin_ids}}'><button class='btn-green'>Lưu & khởi động bot</button></form></section><section id='bank'><h2>◈ Tài khoản nhận tiền</h2><form method='post' action='/admin/bank'><label>Mã ngân hàng</label><input name='bank_code' value='{{bank.bank_code}}'><label>Số tài khoản</label><input name='account_no' value='{{bank.account_no}}'><label>Tên chủ tài khoản</label><input name='account_name' value='{{bank.account_name}}'><label>Tiền tố nội dung</label><input name='note_prefix' value='{{bank.note_prefix}}'><label>Link liên hệ admin</label><input name='contact_link' type='url' placeholder='https://t.me/ten_admin' value='{{bank.contact_link}}'><button>Lưu thông tin VietQR & liên hệ</button></form></section></div><section id='packages'><h2>◇ Quản lý gói key</h2><div class='muted'>Nhập tên gói, giá tiền và số ngày rồi bấm thêm. Không cần sửa JSON.</div><form method='post' action='/admin/package/add' style='display:grid;grid-template-columns:1.3fr 1fr 1fr auto;gap:10px;align-items:end'><div><label>Tên gói</label><input name='name' placeholder='Ví dụ: Gói VIP 7 ngày' required></div><div><label>Giá tiền</label><input name='price' type='number' min='0' placeholder='50000' required></div><div><label>Số ngày</label><input name='days' type='number' min='1' placeholder='7' required></div><button>＋ Thêm gói</button></form><div style='overflow:auto;margin-top:18px'><table><tr><th>Tên gói</th><th>Giá</th><th>Thời hạn</th><th></th></tr>{% for n,p in packages.items() %}<tr><td><b>{{n}}</b></td><td>{{p.price}}</td><td>{{p.days}} ngày</td><td><form method='post' action='/admin/package/delete'><input type='hidden' name='name' value='{{n}}'><button style='background:linear-gradient(135deg,#e65b6e,#b7354b);margin:0'>Xóa</button></form></td></tr>{% else %}<tr><td colspan='4' class='muted'>Chưa có gói.</td></tr>{% endfor %}</table></div></section><section id='deposits' style='margin-top:18px'><h2>⇄ 100 đơn nạp gần nhất</h2><div style='overflow:auto'><table><tr><th>ID</th><th>Telegram ID</th><th>Số tiền</th><th>Nội dung</th><th>Trạng thái</th><th>Thời gian</th></tr>{% for d in deposits %}<tr><td>#{{d.id}}</td><td>{{d.telegram_id}}</td><td><b>{{d.amount}}</b></td><td><code>{{d.content}}</code></td><td><span class='pill {{d.status}}'>{{d.status}}</span></td><td class='muted'>{{d.created_at[:19]}}</td></tr>{% else %}<tr><td colspan='6' class='muted'>Chưa có đơn nạp.</td></tr>{% endfor %}</table></div></section><section id='users' style='margin-top:18px'><h2>👥 Quản lý người dùng & số dư</h2><div style='overflow:auto'><table><tr><th>Telegram ID</th><th>Tên</th><th>Username</th><th>Số dư</th><th>Cộng / trừ tiền</th></tr>{% for u in users %}<tr><td><code>{{u.telegram_id}}</code></td><td>{{u.first_name}}</td><td>@{{u.username}}</td><td><b>{{u.balance}}</b></td><td><form method='post' action='/admin/user/balance' style='display:flex;gap:6px;min-width:290px'><input type='hidden' name='telegram_id' value='{{u.telegram_id}}'><input name='amount' type='number' placeholder='10000' required><button style='margin:0'>Cộng</button><button name='mode' value='subtract' style='margin:0;background:linear-gradient(135deg,#e65b6e,#b7354b)'>Trừ</button></form></td></tr>{% else %}<tr><td colspan='5' class='muted'>Chưa có user.</td></tr>{% endfor %}</table></div></section><section id='keys' style='margin-top:18px'><h2>✦ Quản lý key đang chạy</h2><div class='muted'>Key đang chạy được hiển thị đầu tiên. Khóa key sẽ ngăn kích hoạt mới và vô hiệu hóa key đang dùng; mở khóa cho phép sử dụng lại nếu còn hạn.</div><div style='overflow:auto;margin-top:14px'><table><tr><th>Key</th><th>Gói</th><th>Người dùng</th><th>Hạn dùng</th><th>Trạng thái</th><th>Thao tác</th></tr>{% for k in keys %}<tr><td><code>{{k.key}}</code></td><td>{{k.package_name}}</td><td>{% if k.used_by %}<code>{{k.used_by}}</code>{% else %}<span class='muted'>Chưa dùng</span>{% endif %}</td><td class='muted'>{{k.expires_at or '—'}}</td><td><span class='pill {{'rejected' if k.locked else ('approved' if k.used_by and k.expires_at and k.expires_at > now_iso else 'pending')}}'>{{'ĐANG KHÓA' if k.locked else ('ĐANG CHẠY' if k.used_by and k.expires_at and k.expires_at > now_iso else ('ĐÃ CẤP' if k.used_by else 'CHƯA DÙNG'))}}</span></td><td style='white-space:nowrap'><form method='post' action='/admin/key/toggle' style='display:inline'><input type='hidden' name='key' value='{{k.key}}'><button style='margin:0;background:linear-gradient(135deg,#ffb454,#d98222)'>{{'Mở khóa' if k.locked else 'Khóa'}}</button></form> <form method='post' action='/admin/key/delete' style='display:inline' onsubmit="return confirm('Xóa key này?')"><input type='hidden' name='key' value='{{k.key}}'><button style='margin:0;background:linear-gradient(135deg,#e65b6e,#b7354b)'>Xóa</button></form></td></tr>{% else %}<tr><td colspan='6' class='muted'>Chưa có key.</td></tr>{% endfor %}</table></div><div class='row' style='margin-top:18px'><section><h2>✦ Tạo key nhanh</h2><form method='post' action='/admin/key'><label>Chọn gói</label><select name='package'>{% for n in packages %}<option>{{n}}</option>{% endfor %}</select><button>Tạo key mới</button></form>{% if generated %}<div style='margin-top:18px'>Key mới: <code>{{generated}}</code></div>{% endif %}</section><section><h2>Trạng thái hệ thống</h2><div class='muted'>Health endpoint</div><p><span class='pill approved'>● ONLINE</span> <code>/</code></p><div class='muted'>Database</div><p><span class='pill approved'>● READY</span> SQLite</p></section></div><div class='footer'>{{bot_name}} · Admin Control Center · Dữ liệu được lưu trong SQLite</div></main></div></body></html>
 """
 
 @app.get("/")
@@ -896,12 +953,10 @@ def admin_page():
     with db() as c:
         deposits = c.execute("SELECT * FROM deposits ORDER BY id DESC LIMIT 100").fetchall()
         users = c.execute("SELECT * FROM users ORDER BY last_seen DESC LIMIT 200").fetchall()
-        giftcodes = c.execute("SELECT * FROM giftcodes ORDER BY created_at DESC LIMIT 300").fetchall()
         keys = c.execute("""SELECT k.*, u.username, u.first_name FROM keys k
                           LEFT JOIN users u ON u.telegram_id=k.used_by
                           ORDER BY CASE WHEN k.used_by IS NOT NULL AND k.expires_at>? AND k.locked=0 THEN 0 ELSE 1 END,
-                                   k.created_at DESC""", (iso(now()),)).fetchall()
-        games = c.execute("SELECT * FROM games ORDER BY category,name").fetchall()
+                                   k.created_at DESC LIMIT 300""", (iso(now()),)).fetchall()
         stats = {
             "users": c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],
             "unused_keys": c.execute("SELECT COUNT(*) n FROM keys WHERE used_by IS NULL").fetchone()["n"],
@@ -911,7 +966,7 @@ def admin_page():
     packages = get_setting("packages", DEFAULT_PACKAGES); bank = get_setting("bank", DEFAULT_BANK)
     token = str(get_setting("bot_token", BOT_TOKEN) or "")
     ids = get_setting("admin_ids", sorted(x for x in ADMIN_IDS if x != 0))
-    return render_template_string(ADMIN_HTML, bot_name=BOT_NAME, bot_ready=bool(token), deposits=deposits, users=users, packages=packages, bank=bank, stats=stats, keys=keys, games=games, giftcodes=giftcodes, admin_ids=','.join(map(str, ids)), token_value="", packages_json=json.dumps(packages, ensure_ascii=False, indent=2), generated=request.args.get("generated", ""), now_iso=iso(now()))
+    return render_template_string(ADMIN_HTML, bot_name=BOT_NAME, bot_ready=bool(token), deposits=deposits, users=users, packages=packages, bank=bank, stats=stats, keys=keys, admin_ids=','.join(map(str, ids)), token_value="", packages_json=json.dumps(packages, ensure_ascii=False, indent=2), generated=request.args.get("generated", ""), now_iso=iso(now()))
 
 @app.post("/admin/runtime")
 def admin_runtime():
@@ -1002,117 +1057,6 @@ def admin_key_delete():
     return redirect("/admin#keys")
 
 
-@app.post('/admin/package/edit')
-def admin_package_edit():
-    old=request.form.get('old_name','').strip(); name=request.form.get('name','').strip()
-    try: price,days=int(request.form.get('price','0')),int(request.form.get('days','0'))
-    except ValueError: return 'Giá hoặc ngày không hợp lệ',400
-    packages=get_setting('packages',DEFAULT_PACKAGES)
-    if old not in packages or not name or price<0 or days<1: return 'Dữ liệu gói không hợp lệ',400
-    if name!=old: packages.pop(old,None)
-    packages[name]={'price':price,'days':days}; set_setting('packages',packages)
-    return redirect('/admin#packages')
-
-@app.post('/admin/game/edit')
-def admin_game_edit():
-    slug=request.form.get('slug','').strip(); name=request.form.get('name','').strip(); category=request.form.get('category','tx'); api_url=request.form.get('api_url','').strip()
-    if not slug or not name or category not in ('tx','sicbo','baccarat'): return 'Dữ liệu game không hợp lệ',400
-    with db() as c: c.execute('UPDATE games SET name=?,category=?,api_url=? WHERE slug=?',(name,category,api_url,slug))
-    return redirect('/admin#games')
-
-@app.post('/admin/gift/add')
-def admin_gift_add():
-    code=request.form.get('code','').strip().upper()
-    try: amount,max_uses=int(request.form.get('amount','0')),max(1,int(request.form.get('max_uses','1')))
-    except ValueError: return 'Giftcode không hợp lệ',400
-    if not re.fullmatch(r'[A-Z0-9_-]{3,80}',code) or amount<0: return 'Mã hoặc giá trị không hợp lệ',400
-    with db() as c: c.execute('INSERT OR REPLACE INTO giftcodes(code,amount,max_uses,used_count,created_at) VALUES(?,?,?,?,?)',(code,amount,max_uses,0,iso(now())))
-    return redirect('/admin#giftcodes')
-
-@app.post('/admin/gift/edit')
-def admin_gift_edit():
-    try: amount,max_uses=int(request.form.get('amount','0')),max(1,int(request.form.get('max_uses','1')))
-    except ValueError: return 'Giftcode không hợp lệ',400
-    code=request.form.get('code','').strip().upper(); old_code=request.form.get('old_code','').strip().upper(); active=1 if request.form.get('active') else 0
-    if not old_code or not re.fullmatch(r'[A-Z0-9_-]{3,80}',code) or amount<0: return 'Dữ liệu giftcode không hợp lệ',400
-    with db() as c: c.execute('UPDATE giftcodes SET code=?,amount=?,max_uses=?,active=? WHERE code=?',(code,amount,max_uses,active,old_code))
-    return redirect('/admin#giftcodes')
-
-@app.post('/admin/gift/delete')
-def admin_gift_delete():
-    with db() as c: c.execute('DELETE FROM giftcodes WHERE code=?',(request.form.get('code','').strip().upper(),))
-    return redirect('/admin#giftcodes')
-
-@app.post('/admin/game/toggle')
-def admin_game_toggle():
-    slug=request.form.get('slug','').strip().lower(); field=request.form.get('field','maintenance')
-    if field not in ('locked','maintenance'): return 'Trạng thái không hợp lệ',400
-    with db() as c: c.execute(f'UPDATE games SET {field}=CASE COALESCE({field},0) WHEN 1 THEN 0 ELSE 1 END WHERE slug=?',(slug,))
-    return redirect('/admin#games')
-
-@app.post("/admin/game/add")
-def admin_game_add():
-    name=request.form.get('name','').strip(); slug=re.sub(r'[^a-z0-9-]','-',request.form.get('slug','').strip().lower()).strip('-')
-    category=request.form.get('category','tx').strip(); api_url=request.form.get('api_url','').strip()
-    if not name or not slug or category not in ('tx','sicbo','baccarat'): return 'Tên, slug hoặc loại game không hợp lệ',400
-    emoji={'tx':'🎲','sicbo':'🎯','baccarat':'🃏'}[category]
-    with db() as c: c.execute("INSERT INTO games(slug,name,category,emoji,mode,api_url,created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET name=excluded.name,category=excluded.category,api_url=excluded.api_url", (slug,name,category,emoji,'api',api_url,iso(now())))
-    return redirect('/admin#games')
-
-@app.post("/admin/game/delete")
-def admin_game_delete():
-    slug=request.form.get('slug','').strip()
-    with db() as c: c.execute('DELETE FROM games WHERE slug=?',(slug,))
-    return redirect('/admin#games')
-
-@app.get('/admin/backup')
-def admin_backup_zip():
-    """Tạo backup nhất quán gồm bản SQLite và JSON export toàn bộ bảng."""
-    payload=export_database()
-    mem=io.BytesIO()
-    with zipfile.ZipFile(mem,'w',zipfile.ZIP_DEFLATED) as z:
-        z.writestr('bot_backup.json',json.dumps(payload,ensure_ascii=False,indent=2))
-        if os.path.exists(DB_PATH): z.write(DB_PATH,'bot.sqlite3')
-    mem.seek(0); return send_file(mem,as_attachment=True,download_name='bot-backup-full.zip',mimetype='application/zip')
-
-@app.get('/admin/backup/json')
-def admin_backup_json():
-    return jsonify(export_database())
-
-def export_database():
-    out={'format':'md5tx-full-backup-v1','created_at':iso(now()),'tables':{}}
-    with db() as c:
-        names=[r['name'] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()]
-        for name in names:
-            rows=c.execute('SELECT * FROM "'+name.replace('"','""')+'"').fetchall()
-            out['tables'][name]={'columns':[x[1] for x in c.execute('PRAGMA table_info("'+name.replace('"','""')+'")').fetchall()],'rows':[dict(r) for r in rows]}
-    out['games_api']=BUILTIN_GAME_APIS
-    return out
-
-@app.post('/admin/restore')
-def admin_restore():
-    f=request.files.get('backup_file')
-    if not f: return 'Chưa chọn file backup',400
-    raw=f.read()
-    try:
-        if f.filename.lower().endswith('.zip'):
-            with zipfile.ZipFile(io.BytesIO(raw)) as z: raw=z.read('bot_backup.json')
-        data=json.loads(raw.decode('utf-8'))
-        tables=data.get('tables',{})
-        if not isinstance(tables,dict): raise ValueError('tables không hợp lệ')
-        init_db()
-        with db() as c:
-            for name,info in tables.items():
-                if not re.fullmatch(r'[A-Za-z0-9_]+',name): continue
-                cols=info.get('columns',[]); rows=info.get('rows',[])
-                if not cols: continue
-                safe_cols=','.join('"'+str(x).replace('"','""')+'"' for x in cols); marks=','.join('?' for _ in cols)
-                for row in rows:
-                    try: c.execute('INSERT OR REPLACE INTO "'+name+'" ('+safe_cols+') VALUES ('+marks+')',[row.get(x) for x in cols])
-                    except sqlite3.OperationalError: pass
-        sync_games_from_json(); return redirect('/admin#backup')
-    except Exception as e: return 'File backup không hợp lệ: '+str(e),400
-
 @app.get("/admin/stats")
 def admin_stats_api():
     with db() as c:
@@ -1124,8 +1068,6 @@ def run_web():
 
 if __name__ == "__main__":
     init_db()
-    sync_games_from_json()
-    threading.Thread(target=refresh_all_api_sessions, daemon=True, name="api-auto-refresh").start()
     # Luôn mở web admin trước. Token có thể nhập từ /admin sau khi Render chạy.
     start_bot_if_configured()
     threading.Thread(target=run_web, daemon=True, name="flask-admin").start()
