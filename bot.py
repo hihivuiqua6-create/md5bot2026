@@ -336,6 +336,7 @@ class HashAnalyzer:
         if len(data) < 16:
             return 0.0, 0.0, []
         import math
+        n = len(data)
         tai = xiu = 0.0
         details = []
         nibbles = [(b >> 4) & 0xF for b in data] + [b & 0xF for b in data]
@@ -718,14 +719,20 @@ def play(cid, call=None):
 
 
 def analyze_message(message):
-    if (message.text or "").strip().lower() in ("/start", "/menu"):
+    if (message.text or "").strip().lower() in ("/start", "/menu", "/help"):
         try: bot.clear_step_handler_by_chat_id(message.chat.id)
         except Exception: pass
         register_user(message); welcome(message.chat.id); return
     if not user_key(message.chat.id):
-        bot.send_message(message.chat.id, "🔒 Key đã hết hạn hoặc chưa được kích hoạt.")
+        bot.send_message(message.chat.id, "🔒 Key đã hết hạn hoặc chưa được kích hoạt. Hãy bấm Chơi ngay sau khi mua/kích hoạt key.")
         return
-    out = analyzer.analyze(message.text)
+    try:
+        out = analyzer.analyze(message.text or "")
+    except Exception:
+        log.exception("Lỗi phân tích hash của user %s", message.chat.id)
+        bot.send_message(message.chat.id, "⚠️ Hệ thống gặp lỗi khi phân tích mã này. Hãy gửi lại mã MD5/SHA-256 khác.")
+        bot.register_next_step_handler_by_chat_id(message.chat.id, analyze_message)
+        return
     if not out["ok"]:
         bot.send_message(message.chat.id, "❌ " + out["error"] + "\n\n🔁 Hãy gửi lại mã MD5/SHA hợp lệ.")
         bot.register_next_step_handler_by_chat_id(message.chat.id, analyze_message)
@@ -744,6 +751,16 @@ def analyze_message(message):
     bot.send_message(message.chat.id, text)
     # Giữ phiên chơi mở: user có thể gửi mã tiếp theo ngay lập tức.
     bot.register_next_step_handler_by_chat_id(message.chat.id, analyze_message)
+
+
+@bot.message_handler(func=lambda message: bool(message.text) and not message.text.startswith("/"))
+def direct_hash_message(message):
+    """Cho phép gửi MD5/SHA trực tiếp mà không bắt buộc phải bấm Chơi ngay trước."""
+    text = re.sub(r"\s+", "", message.text or "")
+    if re.fullmatch(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{64}", text):
+        analyze_message(message)
+    else:
+        bot.send_message(message.chat.id, "ℹ️ Hãy bấm Chơi ngay rồi gửi mã MD5 32 ký tự hoặc SHA-256 64 ký tự.")
 
 
 def show_account(cid, call=None):
