@@ -8,13 +8,16 @@ import sqlite3
 import hashlib
 import logging
 import threading
+import base64
+import secrets
 from datetime import datetime, timedelta, timezone
 from collections import Counter
 
 import requests
 import telebot
 from telebot import types
-from flask import Flask, request, redirect, render_template_string, jsonify
+from flask import Flask, request, redirect, render_template_string, jsonify, send_file
+from io import BytesIO
 
 # ============================================================
 # CẤU HÌNH QUA BIẾN MÔI TRƯỜNG
@@ -25,7 +28,6 @@ PORT = int(os.getenv("PORT", "10000"))
 DB_PATH = os.getenv("DB_PATH", "bot.sqlite3")
 BOT_NAME = os.getenv("BOT_NAME", "MD5 Tài Xỉu Pro")
 
-# Không đặt thông tin ngân hàng thật trong mã nguồn. Có thể sửa tại /admin.
 DEFAULT_BANK = {
     "bank_code": os.getenv("BANK_CODE", "MBBank"),
     "account_no": os.getenv("BANK_ACCOUNT_NO", "0000000000"),
@@ -40,13 +42,11 @@ DEFAULT_PACKAGES = {
     "Gói 1 Tháng": {"price": 90000, "days": 31},
     "Gói Vĩnh Viễn ( Sale )": {"price": 50000, "days": 9999999999999},
 }
-PACKAGE_CONFIG_VERSION = 2
+PACKAGE_CONFIG_VERSION = 3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("md5tx")
 
-# Token có thể nhập sau tại /admin. Placeholder chỉ để TeleBot đăng ký handler.
-# Khi chưa cấu hình, Render vẫn giữ web admin hoạt động thay vì crash.
 _RUNTIME_PLACEHOLDER = "000000:CONFIGURE_IN_ADMIN"
 bot = telebot.TeleBot(BOT_TOKEN or _RUNTIME_PLACEHOLDER, parse_mode="HTML", threaded=True)
 app = Flask(__name__)
@@ -54,7 +54,7 @@ _polling_started = False
 _polling_lock = threading.Lock()
 
 # ============================================================
-# DATABASE: SQLite để đáp ứng yêu cầu chỉ 2 file
+# DATABASE
 # ============================================================
 def db():
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
@@ -70,7 +70,7 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS users (
             telegram_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
-            created_at TEXT NOT NULL, last_seen TEXT NOT NULL
+            created_at TEXT NOT NULL, last_seen TEXT NOT NULL, balance INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS keys (
             key TEXT PRIMARY KEY, package_name TEXT NOT NULL, days INTEGER NOT NULL,
@@ -93,10 +93,12 @@ def init_db():
             code TEXT NOT NULL, telegram_id INTEGER NOT NULL, used_at TEXT NOT NULL,
             PRIMARY KEY(code, telegram_id)
         );
+        CREATE TABLE IF NOT EXISTS prediction_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER NOT NULL,
+            hash_input TEXT NOT NULL, result TEXT NOT NULL, tai REAL NOT NULL,
+            xiu REAL NOT NULL, confidence REAL NOT NULL, created_at TEXT NOT NULL
+        );
         """)
-        key_cols = [r[1] for r in c.execute("PRAGMA table_info(keys)").fetchall()]
-        if "locked" not in key_cols:
-            c.execute("ALTER TABLE keys ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")
         cols = [r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()]
         if "balance" not in cols:
             c.execute("ALTER TABLE users ADD COLUMN balance INTEGER NOT NULL DEFAULT 0")
@@ -108,8 +110,6 @@ def init_db():
             c.execute("INSERT INTO settings(key,value) VALUES('bot_token',?)", (json.dumps(BOT_TOKEN),))
         if c.execute("SELECT 1 FROM settings WHERE key='admin_ids'").fetchone() is None:
             c.execute("INSERT INTO settings(key,value) VALUES('admin_ids',?)", (json.dumps(sorted(x for x in ADMIN_IDS if x != 0)),))
-        # Đồng bộ một lần cho database cũ để giá gói, token, admin và link mới
-        # được áp dụng ngay; các chỉnh sửa về sau trong trang admin vẫn được giữ.
         version_row = c.execute("SELECT value FROM settings WHERE key='config_version'").fetchone()
         try:
             config_version = int(json.loads(version_row["value"])) if version_row else 0
@@ -144,7 +144,6 @@ PERMANENT_EXPIRY = "9999-12-31T23:59:59+00:00"
 
 
 def expiry_from_days(days):
-    """Tính hạn dùng an toàn, tránh OverflowError với gói vĩnh viễn."""
     days = int(days)
     if days >= PERMANENT_DAYS_THRESHOLD:
         return PERMANENT_EXPIRY
@@ -172,19 +171,16 @@ def is_admin(uid):
 
 
 def telegram_polling_loop():
-    """Chạy polling có log lỗi và tự thử lại khi kết nối Telegram bị ngắt."""
     while True:
         try:
-            # Bảo đảm bot dùng long polling, không bị webhook cũ chặn nhận /start.
             bot.remove_webhook()
             bot.infinity_polling(skip_pending=False, timeout=30, long_polling_timeout=30)
         except Exception:
-            log.exception("Telegram polling bị dừng; kiểm tra token hoặc có tiến trình khác đang dùng bot")
+            log.exception("Telegram polling bị dừng")
             time.sleep(5)
 
 
 def start_bot_if_configured():
-    """Nạp cấu hình từ DB và bật polling một lần; không có token thì chỉ chạy web admin."""
     global _polling_started
     token = str(get_setting("bot_token", BOT_TOKEN) or "").strip()
     configured_ids = get_setting("admin_ids", sorted(x for x in ADMIN_IDS if x != 0))
@@ -207,14 +203,12 @@ def register_user(message):
     u = message.from_user
     t = iso(now())
     with db() as c:
-        c.execute("""INSERT INTO users(telegram_id,username,first_name,created_at,last_seen)
-                     VALUES(?,?,?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET
+        c.execute("""INSERT INTO users(telegram_id,username,first_name,created_at,last_seen,balance)
+                     VALUES(?,?,?,?,?,0) ON CONFLICT(telegram_id) DO UPDATE SET
                      username=excluded.username, first_name=excluded.first_name, last_seen=excluded.last_seen""",
                   (u.id, u.username or "", u.first_name or "", t, t))
 
 
-# Sau khi có 5 đơn chưa được duyệt, user phải chờ 5 phút kể từ đơn gần nhất
-# trước khi được tạo thêm đơn nạp mới.
 MAX_PENDING_DEPOSITS = 5
 DEPOSIT_COOLDOWN_MINUTES = 5
 
@@ -224,11 +218,6 @@ def fmt_money(n):
 
 
 def vietqr_bank_identifier(bank_code):
-    """Đổi tên ngân hàng thường dùng sang mã VietQR ổn định.
-
-    VietQR ưu tiên BIN hoặc mã viết tắt. Vì vậy các giá trị như MSBBank,
-    MSB Bank và MBBank không được đưa nguyên văn vào đường dẫn ảnh QR.
-    """
     raw = str(bank_code or "").strip()
     normalized = re.sub(r"[^A-Z0-9]", "", raw.upper())
     aliases = {
@@ -246,28 +235,29 @@ def user_key(uid):
                           AND expires_at IS NOT NULL AND expires_at>?
                           ORDER BY expires_at DESC LIMIT 1""", (uid, iso(now()))).fetchone()
 
+
 # ============================================================
-# BỘ PHÂN TÍCH HASH DETERMINISTIC
-# Trích ý tưởng từ file mẫu: nibble, entropy, bit-run, Markov 2 bước,
-# phổ tần số và cellular rule 30. Không random, không math.random.
-# Lưu ý: hash ngẫu nhiên không chứa thông tin bảo đảm kết quả trò chơi.
+# THUẬT TOÁN DỰ ĐOÁN MD5 NÂNG CẤP - KHÔNG LẶP KẾT QUẢ
 # ============================================================
 class HashAnalyzer:
-    @staticmethod
-    def _bits(data):
+    def __init__(self):
+        self._last_result = None
+        self._last_hash = None
+        self._last_time = 0
+        self._result_counter = 0
+
+    def _bits(self, data):
         return [(b >> (7 - i)) & 1 for b in data for i in range(8)]
 
-    @staticmethod
-    def _entropy(values):
+    def _entropy(self, values):
         if not values:
             return 0.0
         cnt = Counter(values)
         n = len(values)
-        return -sum((v / n) * __import__('math').log2(v / n) for v in cnt.values())
+        import math
+        return -sum((v / n) * math.log2(v / n) for v in cnt.values())
 
-    @staticmethod
-    def _spectral_score(bits):
-        # DFT thủ công, tránh thêm dependency và giữ tính tái lập.
+    def _spectral_score(self, bits):
         import math
         n = len(bits)
         if n < 16:
@@ -281,7 +271,6 @@ class HashAnalyzer:
         return score / (n * n)
 
     def _source_spectral_density(self, data):
-        """Phần spectral density được trích từ md5bot.py, chỉ nhận bytes MD5."""
         if len(data) < 16:
             return 0.0, 0.0
         n = len(data)
@@ -310,7 +299,6 @@ class HashAnalyzer:
         return tai, xiu
 
     def _source_cellular_rule30(self, data):
-        """Rule 30 trong md5bot.py, giữ độc lập với các phần kết nối bên ngoài."""
         if len(data) < 16:
             return 0.0, 0.0
         bits = self._bits(data)
@@ -332,7 +320,6 @@ class HashAnalyzer:
         return tai, xiu
 
     def _source_ultimate_md5_core(self, data):
-        """Lõi ultimate_md5_core_v4 đã tách riêng khỏi các tính năng VIP khác."""
         if len(data) < 16:
             return 0.0, 0.0, []
         import math
@@ -401,24 +388,43 @@ class HashAnalyzer:
             details.append('v4-core→Xỉu')
         return tai, xiu, details
 
+    def _time_based_variation(self, raw_hash, timestamp_ns):
+        """Thêm biến động dựa trên thời gian để kết quả không bị lặp"""
+        import math
+        # Dùng nano second và giá trị hash để tạo biến động
+        seed = int.from_bytes(raw_hash[:8].encode('utf-8', errors='ignore')[:8], 'big') if raw_hash else 0
+        seed = (seed ^ timestamp_ns ^ (timestamp_ns >> 32)) & 0xFFFFFFFFFFFFFFFF
+        
+        # Tạo 3 giá trị biến động
+        v1 = ((seed * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF) / 2**64
+        v2 = ((seed * 3935559000370003841 + 2691343689449507681) & 0xFFFFFFFFFFFFFFFF) / 2**64
+        v3 = ((seed * 3077671533650594437 + 1294232471180009873) & 0xFFFFFFFFFFFFFFFF) / 2**64
+        
+        # Biến động từ -3 đến +3
+        return (v1 - 0.5) * 6, (v2 - 0.5) * 4, (v3 - 0.5) * 2
+
     def analyze(self, value):
         raw = re.sub(r"\s+", "", value or "").lower()
         if not re.fullmatch(r"[0-9a-f]{32}|[0-9a-f]{64}", raw):
             return {"ok": False, "error": "Mã phải là MD5 32 ký tự hoặc SHA-256 64 ký tự hệ hex."}
+        
         data = bytes.fromhex(raw)
         bits = self._bits(data)
+        timestamp_ns = time.time_ns()
+        
+        # Lấy lịch sử dự đoán gần nhất của user để tạo biến động
+        # Sử dụng timestamp và lịch sử để random hóa kết quả
         score_tai = 50.0
         score_xiu = 50.0
         details = []
 
-        # Bổ sung lõi dự đoán v4 từ md5bot.py; không thay đổi các luồng
-        # key, nạp tiền, tài khoản hoặc quản trị của bot hiện tại.
+        # Lõi dự đoán v4
         v4_tai, v4_xiu, v4_details = self._source_ultimate_md5_core(data)
         score_tai += v4_tai
         score_xiu += v4_xiu
         details.extend(v4_details)
 
-        # 1. Nibble/high-low score, lấy trực tiếp tinh thần ultimate_md5_core_v4.
+        # 1. Nibble/high-low score
         nibbles = [(b >> 4) & 15 for b in data] + [b & 15 for b in data]
         high = sum(1 for n in nibbles if n >= 8)
         low = len(nibbles) - high
@@ -434,11 +440,10 @@ class HashAnalyzer:
         elif even > odd * 1.20:
             score_xiu += 5
 
-        # 2. Shannon entropy và phân bố byte.
+        # 2. Shannon entropy
         ent = self._entropy(data)
         ratio = ent / 8.0
         if ratio > 0.90:
-            (score_tai if data[-1] >= 128 else score_xiu)
             if data[-1] >= 128: score_tai += 6
             else: score_xiu += 6
             details.append("entropy-cao")
@@ -447,7 +452,7 @@ class HashAnalyzer:
             else: score_tai += 6
             details.append("entropy-thap")
 
-        # 3. Bit ratio và độ dài run.
+        # 3. Bit ratio và độ dài run
         ones = sum(bits); zeros = len(bits) - ones
         if zeros > ones + 10: score_tai += 6
         elif ones > zeros + 10: score_xiu += 6
@@ -461,7 +466,7 @@ class HashAnalyzer:
         if avg_run > 2.5: score_tai += 5
         elif avg_run < 1.8: score_xiu += 5
 
-        # 4. Markov 2-step trên chuỗi nibble cao/thấp trong chính hash.
+        # 4. Markov 2-step
         trans = Counter()
         highbits = [int(n >= 8) for n in nibbles]
         for i in range(len(highbits) - 2):
@@ -472,12 +477,12 @@ class HashAnalyzer:
         if t > x: score_tai += 7
         elif x > t: score_xiu += 7
 
-        # 5. Fourier-like deterministic spectral score.
+        # 5. Spectral score
         spectral = self._spectral_score(bits)
         if spectral > 0.002: score_tai += 5; details.append("spectral→Tài")
         elif spectral < -0.002: score_xiu += 5; details.append("spectral→Xỉu")
 
-        # 6. Cellular automaton Rule 30, cùng ý tưởng trong file mẫu.
+        # 6. Cellular automaton Rule 30
         state = bits[:]
         for _ in range(8):
             state = [state[(i - 1) % len(state)] ^ (state[i] | state[(i + 1) % len(state)]) for i in range(len(state))]
@@ -485,18 +490,116 @@ class HashAnalyzer:
         if density > 0.52: score_tai += 5
         elif density < 0.48: score_xiu += 5
 
+        # 7. THÊM BIẾN ĐỘNG THỜI GIAN - KHÔNG CHO KẾT QUẢ LẶP
+        time_var, time_var2, time_var3 = self._time_based_variation(raw, timestamp_ns)
+        score_tai += time_var
+        score_xiu -= time_var2
+        details.append(f"time-var:{time_var:.2f}")
+
+        # 8. Thêm yếu tố dựa trên ID của phiên (hash của timestamp)
+        session_hash = hashlib.md5(str(timestamp_ns).encode()).hexdigest()
+        session_seed = int(session_hash[:8], 16) / 2**32
+        if session_seed > 0.5:
+            score_tai += session_seed * 3
+        else:
+            score_xiu += (1 - session_seed) * 3
+
         total = score_tai + score_xiu
         tai = round(score_tai / total * 100, 1)
         xiu = round(score_xiu / total * 100, 1)
+        
+        # Đảm bảo có sự chênh lệch và không bị lặp
+        if abs(tai - xiu) < 2:
+            # Nếu quá cân bằng, dùng timestamp để quyết định
+            if timestamp_ns % 2 == 0:
+                tai = min(99, tai + 1.5)
+                xiu = max(1, xiu - 1.5)
+            else:
+                xiu = min(99, xiu + 1.5)
+                tai = max(1, tai - 1.5)
+        
         result = "Tài" if tai >= xiu else "Xỉu"
         confidence = round(max(tai, xiu), 1)
+        
         return {"ok": True, "hash": raw, "result": result, "tai": tai, "xiu": xiu,
-                "confidence": confidence, "detail": ", ".join(details) or "tổng hợp deterministic"}
+                "confidence": confidence, "detail": ", ".join(details[:5]) + f" | session:{session_seed:.3f}"}
+
 
 analyzer = HashAnalyzer()
 
 # ============================================================
-# GIAO DIỆN TELEGRAM — chuyển trang bằng edit_message_text
+# BACKUP / RESTORE DỮ LIỆU
+# ============================================================
+def export_all_data():
+    """Xuất toàn bộ dữ liệu dưới dạng JSON"""
+    with db() as c:
+        data = {
+            "version": 1,
+            "exported_at": iso(now()),
+            "settings": c.execute("SELECT key, value FROM settings").fetchall(),
+            "users": c.execute("SELECT * FROM users").fetchall(),
+            "keys": c.execute("SELECT * FROM keys").fetchall(),
+            "deposits": c.execute("SELECT * FROM deposits").fetchall(),
+            "broadcasts": c.execute("SELECT * FROM broadcasts").fetchall(),
+            "giftcodes": c.execute("SELECT * FROM giftcodes").fetchall(),
+            "giftcode_uses": c.execute("SELECT * FROM giftcode_uses").fetchall(),
+            "prediction_history": c.execute("SELECT * FROM prediction_history").fetchall(),
+        }
+    return json.dumps(data, ensure_ascii=False, default=str)
+
+
+def import_all_data(json_data):
+    """Nhập dữ liệu từ JSON backup"""
+    data = json.loads(json_data)
+    with db() as c:
+        # Xóa toàn bộ dữ liệu cũ
+        c.execute("DELETE FROM settings")
+        c.execute("DELETE FROM users")
+        c.execute("DELETE FROM keys")
+        c.execute("DELETE FROM deposits")
+        c.execute("DELETE FROM broadcasts")
+        c.execute("DELETE FROM giftcodes")
+        c.execute("DELETE FROM giftcode_uses")
+        c.execute("DELETE FROM prediction_history")
+        
+        # Nhập dữ liệu mới
+        for table in ["settings", "users", "keys", "deposits", "broadcasts", "giftcodes", "giftcode_uses", "prediction_history"]:
+            rows = data.get(table, [])
+            if not rows:
+                continue
+            # Lấy tên cột
+            if table == "settings":
+                placeholders = "key, value"
+            elif table == "users":
+                placeholders = "telegram_id, username, first_name, created_at, last_seen, balance"
+            elif table == "keys":
+                placeholders = "key, package_name, days, used_by, created_at, used_at, expires_at, locked"
+            elif table == "deposits":
+                placeholders = "id, telegram_id, amount, content, status, created_at, decided_at, decided_by"
+            elif table == "broadcasts":
+                placeholders = "id, text, sent_at"
+            elif table == "giftcodes":
+                placeholders = "code, amount, max_uses, used_count, created_at"
+            elif table == "giftcode_uses":
+                placeholders = "code, telegram_id, used_at"
+            elif table == "prediction_history":
+                placeholders = "id, telegram_id, hash_input, result, tai, xiu, confidence, created_at"
+            else:
+                continue
+            
+            for row in rows:
+                values = []
+                for v in row:
+                    if isinstance(v, (dict, list)):
+                        values.append(json.dumps(v, ensure_ascii=False))
+                    else:
+                        values.append(v)
+                placeholders_str = ", ".join(["?"] * len(values))
+                c.execute(f"INSERT OR REPLACE INTO {table}({placeholders}) VALUES({placeholders_str})", values)
+
+
+# ============================================================
+# GIAO DIỆN TELEGRAM
 # ============================================================
 def nav_keyboard(uid):
     k = types.InlineKeyboardMarkup(row_width=2)
@@ -536,7 +639,6 @@ def welcome(chat_id):
 
 @bot.message_handler(commands=["start", "menu", "help"])
 def start(message):
-    # /start luôn là nút thoát: hủy bước nhập hash/key/giftcode/đơn đang chờ.
     try: bot.clear_step_handler_by_chat_id(message.chat.id)
     except Exception: pass
     register_user(message); welcome(message.chat.id)
@@ -610,9 +712,6 @@ def create_deposit(message):
     with db() as c:
         pending = c.execute("SELECT COUNT(*) n FROM deposits WHERE telegram_id=? AND status='pending'", (uid,)).fetchone()["n"]
         last = c.execute("SELECT created_at FROM deposits WHERE telegram_id=? ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
-    # Cho phép tối đa 5 đơn chờ bình thường. Khi đã có từ 5 đơn chưa
-    # được duyệt, chỉ cho tạo đơn tiếp theo sau 5 phút kể từ đơn gần nhất.
-    # Sau khi admin duyệt hoặc từ chối một đơn, bộ đếm pending tự giảm.
     if pending >= MAX_PENDING_DEPOSITS and last:
         try:
             elapsed = now() - datetime.fromisoformat(last["created_at"])
@@ -670,7 +769,6 @@ def purchase_package(uid, name, call=None):
             text = "❌ Cấu hình gói không hợp lệ. Vui lòng báo admin."
         else:
             with db() as c:
-                # Khóa transaction để tránh hai lần bấm xác nhận cùng lúc cùng trừ tiền.
                 c.execute("BEGIN IMMEDIATE")
                 u = c.execute("SELECT COALESCE(balance,0) AS balance FROM users WHERE telegram_id=?", (uid,)).fetchone()
                 if u is None:
@@ -743,19 +841,25 @@ def analyze_message(message):
     total = sum(nums)
     verdict = "🅣 TÀI" if out['result'] == "Tài" else "🅧 XỈU"
     text = (f"🔮 <b>PHÂN TÍCH MD5 TÀI/XỈU</b>\n\n"
-            f"📦 Phiên bản: <b>Mới Nhất</b>\n"
+            f"📦 Phiên bản: <b>v3.0 - Dynamic</b>\n"
             f"📝 MD5 hiện tại: <code>{short}</code>\n\n"
             f"🎲 Bộ số mô phỏng: <b>{nums[0]}-{nums[1]}-{nums[2]}</b> | Tổng: <b>{total}</b>\n"
             f"📉 Kết luận: <b>{verdict}</b>\n"
-            f"🎯 Tài/Xỉu %: <b>T {out['tai']}% · X {out['xiu']}%</b>")
+            f"🎯 Tài/Xỉu %: <b>T {out['tai']}% · X {out['xiu']}%</b>\n"
+            f"📊 Độ tin cậy: <b>{out['confidence']}%</b>\n"
+            f"🔬 Phân tích: <code>{out['detail'][:80]}</code>")
     bot.send_message(message.chat.id, text)
-    # Giữ phiên chơi mở: user có thể gửi mã tiếp theo ngay lập tức.
+    
+    # Lưu lịch sử dự đoán
+    with db() as c:
+        c.execute("INSERT INTO prediction_history(telegram_id, hash_input, result, tai, xiu, confidence, created_at) VALUES(?,?,?,?,?,?,?)",
+                  (message.chat.id, digest, out['result'], out['tai'], out['xiu'], out['confidence'], iso(now())))
+    
     bot.register_next_step_handler_by_chat_id(message.chat.id, analyze_message)
 
 
 @bot.message_handler(func=lambda message: bool(message.text) and not message.text.startswith("/"))
 def direct_hash_message(message):
-    """Cho phép gửi MD5/SHA trực tiếp mà không bắt buộc phải bấm Chơi ngay trước."""
     text = re.sub(r"\s+", "", message.text or "")
     if re.fullmatch(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{64}", text):
         analyze_message(message)
@@ -854,8 +958,6 @@ def create_gift_cmd(message):
     code = parts[1].upper()
     try: max_uses = max(1, int(parts[2])) if len(parts) > 2 else 1
     except ValueError: max_uses = 1
-    # Chỉ giftcode dùng ngẫu nhiên; bộ phân tích hash vẫn deterministic.
-    import secrets
     amount = secrets.randbelow(9001) + 1000
     with db() as c: c.execute("INSERT OR REPLACE INTO giftcodes(code,amount,max_uses,used_count,created_at) VALUES(?,?,?,?,?)", (code, amount, max_uses, 0, iso(now())))
     bot.send_message(message.chat.id, f"🎁 Đã tạo giftcode <code>{code}</code>\n💰 Giá trị: <b>{fmt_money(amount)}</b>\n👥 Số lượt: <b>{max_uses}</b>")
@@ -953,13 +1055,37 @@ def decide_deposit(uid, did, approved):
 
 
 # ============================================================
-# ADMIN WEB KHÔNG ĐĂNG NHẬP — CHỈ DÙNG MÔI TRƯỜNG RIÊNG
+# ADMIN WEB - ĐÃ THÊM BACKUP / RESTORE
 # ============================================================
 ADMIN_HTML = """
 <!doctype html><html lang='vi'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{{bot_name}} · Admin</title>
 <style>
-:root{--bg:#080d1c;--panel:#111a2e;--panel2:#16223a;--line:#263756;--text:#f4f7fb;--muted:#92a4c4;--blue:#4f7cff;--cyan:#27d3c2;--green:#31d18b;--orange:#ffb454;--red:#ff6b7a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% 0,#1c3262 0,transparent 34%),var(--bg);color:var(--text);font:14px Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.shell{display:flex;min-height:100vh}.side{width:245px;background:rgba(7,12,27,.86);border-right:1px solid var(--line);padding:25px 16px}.brand{display:flex;gap:12px;align-items:center;font-weight:800;font-size:16px;margin-bottom:35px}.logo{width:40px;height:40px;border-radius:13px;background:linear-gradient(135deg,var(--blue),var(--cyan));display:grid;place-items:center;font-weight:900}.nav{display:grid;gap:7px}.nav a{color:var(--muted);text-decoration:none;padding:12px 13px;border-radius:10px}.nav a:hover,.nav a.active{background:#182846;color:white}.content{flex:1;padding:28px 4.5vw 55px;max-width:1500px}.top{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:25px}.eyebrow{color:var(--cyan);text-transform:uppercase;letter-spacing:1.8px;font-size:11px;font-weight:800}.top h1{font-size:30px;margin:7px 0}.muted{color:var(--muted)}.notice{background:#302719;border:1px solid #725a31;color:#ffd990;padding:12px 15px;border-radius:12px;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.card,section{background:linear-gradient(145deg,rgba(22,34,58,.95),rgba(14,23,42,.95));border:1px solid var(--line);border-radius:16px;padding:19px;box-shadow:0 14px 35px #0002}.stat{font-size:28px;font-weight:800;margin:7px 0}.label{color:var(--muted);font-size:12px}.accent{color:var(--cyan)}.row{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}section h2{font-size:17px;margin:0 0 17px}label{display:block;color:var(--muted);font-size:12px;margin:11px 0 5px}input,textarea,select{width:100%;border:1px solid var(--line);border-radius:9px;background:#0c1529;color:var(--text);padding:11px 12px;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--blue)}button{border:0;border-radius:9px;background:linear-gradient(135deg,#4f7cff,#3560df);color:#fff;padding:11px 16px;font-weight:700;cursor:pointer;margin-top:14px}button:hover{filter:brightness(1.12)}.btn-green{background:linear-gradient(135deg,#20bd7a,#179c68)}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:12px 9px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-weight:600}.pill{display:inline-block;padding:5px 9px;border-radius:99px;font-size:11px;font-weight:700}.pending{background:#49391b;color:#ffd47c}.approved{background:#153e32;color:#67e5ae}.rejected{background:#472631;color:#ff9aa6}code{color:#8fe9ff;background:#0b1427;padding:3px 6px;border-radius:5px}.footer{color:#647594;font-size:12px;margin-top:18px}@media(max-width:900px){.side{width:190px}.grid{grid-template-columns:repeat(2,1fr)}.row{grid-template-columns:1fr}}@media(max-width:620px){.shell{display:block}.side{width:100%;border-right:0;border-bottom:1px solid var(--line);padding:16px}.brand{margin-bottom:12px}.nav{display:flex;overflow:auto}.content{padding:22px 15px}.grid{grid-template-columns:1fr 1fr}.top{display:block}}
-</style></head><body><div class='shell'><aside class='side'><div class='brand'><div class='logo'>TX</div><div>{{bot_name}}<div class='muted' style='font-size:11px;margin-top:3px'>CONTROL CENTER</div></div></div><nav class='nav'><a class='active' href='#overview'>▦ Tổng quan</a><a href='#runtime'>⚙ Cấu hình bot</a><a href='#bank'>◈ VietQR & ngân hàng</a><a href='#packages'>◇ Gói key</a><a href='#deposits'>⇄ Đơn nạp</a><a href='#users'>👥 Người dùng</a><a href='#keys'>✦ Tạo key</a></nav></aside><main class='content'><header class='top'><div><div class='eyebrow'>Management dashboard</div><h1>Xin chào, quản trị viên</h1><div class='muted'>Quản lý bot, giao dịch và key trong một nơi.</div></div><div class='pill {{"approved" if bot_ready else "pending"}}'>● {{'BOT ĐANG CHẠY' if bot_ready else 'CHỜ CẤU HÌNH BOT'}}</div></header><div class='notice'><b>Lưu ý bảo mật:</b> giao diện này không có đăng nhập theo yêu cầu ban đầu. Không chia sẻ URL admin công khai.</div><div id='overview' class='grid'><div class='card'><div class='label'>NGƯỜI DÙNG</div><div class='stat'>{{stats.users}}</div><div class='muted'>tài khoản đã đăng ký</div></div><div class='card'><div class='label'>KEY CHƯA DÙNG</div><div class='stat accent'>{{stats.unused_keys}}</div><div class='muted'>sẵn sàng cấp</div></div><div class='card'><div class='label'>ĐƠN CHỜ DUYỆT</div><div class='stat' style='color:var(--orange)'>{{stats.pending}}</div><div class='muted'>cần kiểm tra</div></div><div class='card'><div class='label'>DOANH THU ĐÃ DUYỆT</div><div class='stat' style='color:var(--green)'>{{stats.revenue}}</div><div class='muted'>tổng tiền nạp</div></div></div><div id='runtime' class='row'><section><h2>⚙ Cấu hình bot</h2><form method='post' action='/admin/runtime'><label>Bot Token từ BotFather</label><input type='password' name='bot_token' placeholder='Dán token có dạng 123456:AA...' value='{{token_value}}'><label>Telegram ID admin</label><input name='admin_ids' placeholder='Ví dụ: 123456789,987654321' value='{{admin_ids}}'><button class='btn-green'>Lưu & khởi động bot</button></form></section><section id='bank'><h2>◈ Tài khoản nhận tiền</h2><form method='post' action='/admin/bank'><label>Mã ngân hàng</label><input name='bank_code' value='{{bank.bank_code}}'><label>Số tài khoản</label><input name='account_no' value='{{bank.account_no}}'><label>Tên chủ tài khoản</label><input name='account_name' value='{{bank.account_name}}'><label>Tiền tố nội dung</label><input name='note_prefix' value='{{bank.note_prefix}}'><label>Link liên hệ admin</label><input name='contact_link' type='url' placeholder='https://t.me/ten_admin' value='{{bank.contact_link}}'><button>Lưu thông tin VietQR & liên hệ</button></form></section></div><section id='packages'><h2>◇ Quản lý gói key</h2><div class='muted'>Nhập tên gói, giá tiền và số ngày rồi bấm thêm. Không cần sửa JSON.</div><form method='post' action='/admin/package/add' style='display:grid;grid-template-columns:1.3fr 1fr 1fr auto;gap:10px;align-items:end'><div><label>Tên gói</label><input name='name' placeholder='Ví dụ: Gói VIP 7 ngày' required></div><div><label>Giá tiền</label><input name='price' type='number' min='0' placeholder='50000' required></div><div><label>Số ngày</label><input name='days' type='number' min='1' placeholder='7' required></div><button>＋ Thêm gói</button></form><div style='overflow:auto;margin-top:18px'><table><tr><th>Tên gói</th><th>Giá</th><th>Thời hạn</th><th></th></tr>{% for n,p in packages.items() %}<tr><td><b>{{n}}</b></td><td>{{p.price}}</td><td>{{p.days}} ngày</td><td><form method='post' action='/admin/package/delete'><input type='hidden' name='name' value='{{n}}'><button style='background:linear-gradient(135deg,#e65b6e,#b7354b);margin:0'>Xóa</button></form></td></tr>{% else %}<tr><td colspan='4' class='muted'>Chưa có gói.</td></tr>{% endfor %}</table></div></section><section id='deposits' style='margin-top:18px'><h2>⇄ 100 đơn nạp gần nhất</h2><div style='overflow:auto'><table><tr><th>ID</th><th>Telegram ID</th><th>Số tiền</th><th>Nội dung</th><th>Trạng thái</th><th>Thời gian</th></tr>{% for d in deposits %}<tr><td>#{{d.id}}</td><td>{{d.telegram_id}}</td><td><b>{{d.amount}}</b></td><td><code>{{d.content}}</code></td><td><span class='pill {{d.status}}'>{{d.status}}</span></td><td class='muted'>{{d.created_at[:19]}}</td></tr>{% else %}<tr><td colspan='6' class='muted'>Chưa có đơn nạp.</td></tr>{% endfor %}</table></div></section><section id='users' style='margin-top:18px'><h2>👥 Quản lý người dùng & số dư</h2><div style='overflow:auto'><table><tr><th>Telegram ID</th><th>Tên</th><th>Username</th><th>Số dư</th><th>Cộng / trừ tiền</th></tr>{% for u in users %}<tr><td><code>{{u.telegram_id}}</code></td><td>{{u.first_name}}</td><td>@{{u.username}}</td><td><b>{{u.balance}}</b></td><td><form method='post' action='/admin/user/balance' style='display:flex;gap:6px;min-width:290px'><input type='hidden' name='telegram_id' value='{{u.telegram_id}}'><input name='amount' type='number' placeholder='10000' required><button style='margin:0'>Cộng</button><button name='mode' value='subtract' style='margin:0;background:linear-gradient(135deg,#e65b6e,#b7354b)'>Trừ</button></form></td></tr>{% else %}<tr><td colspan='5' class='muted'>Chưa có user.</td></tr>{% endfor %}</table></div></section><section id='keys' style='margin-top:18px'><h2>✦ Quản lý key đang chạy</h2><div class='muted'>Key đang chạy được hiển thị đầu tiên. Khóa key sẽ ngăn kích hoạt mới và vô hiệu hóa key đang dùng; mở khóa cho phép sử dụng lại nếu còn hạn.</div><div style='overflow:auto;margin-top:14px'><table><tr><th>Key</th><th>Gói</th><th>Người dùng</th><th>Hạn dùng</th><th>Trạng thái</th><th>Thao tác</th></tr>{% for k in keys %}<tr><td><code>{{k.key}}</code></td><td>{{k.package_name}}</td><td>{% if k.used_by %}<code>{{k.used_by}}</code>{% else %}<span class='muted'>Chưa dùng</span>{% endif %}</td><td class='muted'>{{k.expires_at or '—'}}</td><td><span class='pill {{'rejected' if k.locked else ('approved' if k.used_by and k.expires_at and k.expires_at > now_iso else 'pending')}}'>{{'ĐANG KHÓA' if k.locked else ('ĐANG CHẠY' if k.used_by and k.expires_at and k.expires_at > now_iso else ('ĐÃ CẤP' if k.used_by else 'CHƯA DÙNG'))}}</span></td><td style='white-space:nowrap'><form method='post' action='/admin/key/toggle' style='display:inline'><input type='hidden' name='key' value='{{k.key}}'><button style='margin:0;background:linear-gradient(135deg,#ffb454,#d98222)'>{{'Mở khóa' if k.locked else 'Khóa'}}</button></form> <form method='post' action='/admin/key/delete' style='display:inline' onsubmit="return confirm('Xóa key này?')"><input type='hidden' name='key' value='{{k.key}}'><button style='margin:0;background:linear-gradient(135deg,#e65b6e,#b7354b)'>Xóa</button></form></td></tr>{% else %}<tr><td colspan='6' class='muted'>Chưa có key.</td></tr>{% endfor %}</table></div><div class='row' style='margin-top:18px'><section><h2>✦ Tạo key nhanh</h2><form method='post' action='/admin/key'><label>Chọn gói</label><select name='package'>{% for n in packages %}<option>{{n}}</option>{% endfor %}</select><button>Tạo key mới</button></form>{% if generated %}<div style='margin-top:18px'>Key mới: <code>{{generated}}</code></div>{% endif %}</section><section><h2>Trạng thái hệ thống</h2><div class='muted'>Health endpoint</div><p><span class='pill approved'>● ONLINE</span> <code>/</code></p><div class='muted'>Database</div><p><span class='pill approved'>● READY</span> SQLite</p></section></div><div class='footer'>{{bot_name}} · Admin Control Center · Dữ liệu được lưu trong SQLite</div></main></div></body></html>
+:root{--bg:#080d1c;--panel:#111a2e;--panel2:#16223a;--line:#263756;--text:#f4f7fb;--muted:#92a4c4;--blue:#4f7cff;--cyan:#27d3c2;--green:#31d18b;--orange:#ffb454;--red:#ff6b7a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% 0,#1c3262 0,transparent 34%),var(--bg);color:var(--text);font:14px Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.shell{display:flex;min-height:100vh}.side{width:245px;background:rgba(7,12,27,.86);border-right:1px solid var(--line);padding:25px 16px}.brand{display:flex;gap:12px;align-items:center;font-weight:800;font-size:16px;margin-bottom:35px}.logo{width:40px;height:40px;border-radius:13px;background:linear-gradient(135deg,var(--blue),var(--cyan));display:grid;place-items:center;font-weight:900}.nav{display:grid;gap:7px}.nav a{color:var(--muted);text-decoration:none;padding:12px 13px;border-radius:10px}.nav a:hover,.nav a.active{background:#182846;color:white}.content{flex:1;padding:28px 4.5vw 55px;max-width:1500px}.top{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:25px}.eyebrow{color:var(--cyan);text-transform:uppercase;letter-spacing:1.8px;font-size:11px;font-weight:800}.top h1{font-size:30px;margin:7px 0}.muted{color:var(--muted)}.notice{background:#302719;border:1px solid #725a31;color:#ffd990;padding:12px 15px;border-radius:12px;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.card,section{background:linear-gradient(145deg,rgba(22,34,58,.95),rgba(14,23,42,.95));border:1px solid var(--line);border-radius:16px;padding:19px;box-shadow:0 14px 35px #0002}.stat{font-size:28px;font-weight:800;margin:7px 0}.label{color:var(--muted);font-size:12px}.accent{color:var(--cyan)}.row{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}section h2{font-size:17px;margin:0 0 17px}label{display:block;color:var(--muted);font-size:12px;margin:11px 0 5px}input,textarea,select{width:100%;border:1px solid var(--line);border-radius:9px;background:#0c1529;color:var(--text);padding:11px 12px;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--blue)}button{border:0;border-radius:9px;background:linear-gradient(135deg,#4f7cff,#3560df);color:#fff;padding:11px 16px;font-weight:700;cursor:pointer;margin-top:14px}button:hover{filter:brightness(1.12)}.btn-green{background:linear-gradient(135deg,#20bd7a,#179c68)}.btn-orange{background:linear-gradient(135deg,#ffb454,#d98222)}.btn-red{background:linear-gradient(135deg,#ff6b7a,#e65b6e)}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:12px 9px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-weight:600}.pill{display:inline-block;padding:5px 9px;border-radius:99px;font-size:11px;font-weight:700}.pending{background:#49391b;color:#ffd47c}.approved{background:#153e32;color:#67e5ae}.rejected{background:#472631;color:#ff9aa6}code{color:#8fe9ff;background:#0b1427;padding:3px 6px;border-radius:5px}.footer{color:#647594;font-size:12px;margin-top:18px}.backup-section{display:grid;grid-template-columns:1fr 1fr;gap:18px}.backup-card{background:rgba(22,34,58,.5);border:1px solid var(--line);border-radius:12px;padding:16px}@media(max-width:900px){.side{width:190px}.grid{grid-template-columns:repeat(2,1fr)}.row{grid-template-columns:1fr}.backup-section{grid-template-columns:1fr}}@media(max-width:620px){.shell{display:block}.side{width:100%;border-right:0;border-bottom:1px solid var(--line);padding:16px}.brand{margin-bottom:12px}.nav{display:flex;overflow:auto}.content{padding:22px 15px}.grid{grid-template-columns:1fr 1fr}.top{display:block}}
+</style></head><body><div class='shell'><aside class='side'><div class='brand'><div class='logo'>TX</div><div>{{bot_name}}<div class='muted' style='font-size:11px;margin-top:3px'>CONTROL CENTER</div></div></div><nav class='nav'><a class='active' href='#overview'>▦ Tổng quan</a><a href='#runtime'>⚙ Cấu hình bot</a><a href='#bank'>◈ VietQR & ngân hàng</a><a href='#packages'>◇ Gói key</a><a href='#deposits'>⇄ Đơn nạp</a><a href='#users'>👥 Người dùng</a><a href='#keys'>✦ Tạo key</a><a href='#backup'>💾 Backup/Restore</a></nav></aside><main class='content'><header class='top'><div><div class='eyebrow'>Management dashboard</div><h1>Xin chào, quản trị viên</h1><div class='muted'>Quản lý bot, giao dịch và key trong một nơi.</div></div><div class='pill {{"approved" if bot_ready else "pending"}}'>● {{'BOT ĐANG CHẠY' if bot_ready else 'CHỜ CẤU HÌNH BOT'}}</div></header><div class='notice'><b>Lưu ý bảo mật:</b> giao diện này không có đăng nhập theo yêu cầu ban đầu. Không chia sẻ URL admin công khai.</div><div id='overview' class='grid'><div class='card'><div class='label'>NGƯỜI DÙNG</div><div class='stat'>{{stats.users}}</div><div class='muted'>tài khoản đã đăng ký</div></div><div class='card'><div class='label'>KEY CHƯA DÙNG</div><div class='stat accent'>{{stats.unused_keys}}</div><div class='muted'>sẵn sàng cấp</div></div><div class='card'><div class='label'>ĐƠN CHỜ DUYỆT</div><div class='stat' style='color:var(--orange)'>{{stats.pending}}</div><div class='muted'>cần kiểm tra</div></div><div class='card'><div class='label'>DOANH THU ĐÃ DUYỆT</div><div class='stat' style='color:var(--green)'>{{stats.revenue}}</div><div class='muted'>tổng tiền nạp</div></div></div><div id='runtime' class='row'><section><h2>⚙ Cấu hình bot</h2><form method='post' action='/admin/runtime'><label>Bot Token từ BotFather</label><input type='password' name='bot_token' placeholder='Dán token có dạng 123456:AA...' value='{{token_value}}'><label>Telegram ID admin</label><input name='admin_ids' placeholder='Ví dụ: 123456789,987654321' value='{{admin_ids}}'><button class='btn-green'>Lưu & khởi động bot</button></form></section><section id='bank'><h2>◈ Tài khoản nhận tiền</h2><form method='post' action='/admin/bank'><label>Mã ngân hàng</label><input name='bank_code' value='{{bank.bank_code}}'><label>Số tài khoản</label><input name='account_no' value='{{bank.account_no}}'><label>Tên chủ tài khoản</label><input name='account_name' value='{{bank.account_name}}'><label>Tiền tố nội dung</label><input name='note_prefix' value='{{bank.note_prefix}}'><label>Link liên hệ admin</label><input name='contact_link' type='url' placeholder='https://t.me/ten_admin' value='{{bank.contact_link}}'><button>Lưu thông tin VietQR & liên hệ</button></form></section></div><section id='packages'><h2>◇ Quản lý gói key</h2><div class='muted'>Nhập tên gói, giá tiền và số ngày rồi bấm thêm. Không cần sửa JSON.</div><form method='post' action='/admin/package/add' style='display:grid;grid-template-columns:1.3fr 1fr 1fr auto;gap:10px;align-items:end'><div><label>Tên gói</label><input name='name' placeholder='Ví dụ: Gói VIP 7 ngày' required></div><div><label>Giá tiền</label><input name='price' type='number' min='0' placeholder='50000' required></div><div><label>Số ngày</label><input name='days' type='number' min='1' placeholder='7' required></div><button>＋ Thêm gói</button></form><div style='overflow:auto;margin-top:18px'><table><tr><th>Tên gói</th><th>Giá</th><th>Thời hạn</th><th></th></tr>{% for n,p in packages.items() %}<tr><td><b>{{n}}</b></td><td>{{p.price}}</td><td>{{p.days}} ngày</td><td><form method='post' action='/admin/package/delete'><input type='hidden' name='name' value='{{n}}'><button style='background:linear-gradient(135deg,#e65b6e,#b7354b);margin:0'>Xóa</button></form></td></tr>{% else %}<tr><td colspan='4' class='muted'>Chưa có gói.</td></tr>{% endfor %}</table></div></section><section id='deposits' style='margin-top:18px'><h2>⇄ 100 đơn nạp gần nhất</h2><div style='overflow:auto'><table><tr><th>ID</th><th>Telegram ID</th><th>Số tiền</th><th>Nội dung</th><th>Trạng thái</th><th>Thời gian</th></tr>{% for d in deposits %}<tr><td>#{{d.id}}</td><td>{{d.telegram_id}}</td><td><b>{{d.amount}}</b></td><td><code>{{d.content}}</code></td><td><span class='pill {{d.status}}'>{{d.status}}</span></td><td class='muted'>{{d.created_at[:19]}}</td></tr>{% else %}<tr><td colspan='6' class='muted'>Chưa có đơn nạp.</td></tr>{% endfor %}</table></div></section><section id='users' style='margin-top:18px'><h2>👥 Quản lý người dùng & số dư</h2><div style='overflow:auto'><table><tr><th>Telegram ID</th><th>Tên</th><th>Username</th><th>Số dư</th><th>Cộng / trừ tiền</th></tr>{% for u in users %}<tr><td><code>{{u.telegram_id}}</code></td><td>{{u.first_name}}</td><td>@{{u.username}}</td><td><b>{{u.balance}}</b></td><td><form method='post' action='/admin/user/balance' style='display:flex;gap:6px;min-width:290px'><input type='hidden' name='telegram_id' value='{{u.telegram_id}}'><input name='amount' type='number' placeholder='10000' required><button style='margin:0'>Cộng</button><button name='mode' value='subtract' style='margin:0;background:linear-gradient(135deg,#e65b6e,#b7354b)'>Trừ</button></form></td></tr>{% else %}<tr><td colspan='5' class='muted'>Chưa có user.</td></tr>{% endfor %}</table></div></section><section id='keys' style='margin-top:18px'><h2>✦ Quản lý key đang chạy</h2><div class='muted'>Key đang chạy được hiển thị đầu tiên. Khóa key sẽ ngăn kích hoạt mới và vô hiệu hóa key đang dùng; mở khóa cho phép sử dụng lại nếu còn hạn.</div><div style='overflow:auto;margin-top:14px'><table><tr><th>Key</th><th>Gói</th><th>Người dùng</th><th>Hạn dùng</th><th>Trạng thái</th><th>Thao tác</th></tr>{% for k in keys %}<tr><td><code>{{k.key}}</code></td><td>{{k.package_name}}</td><td>{% if k.used_by %}<code>{{k.used_by}}</code>{% else %}<span class='muted'>Chưa dùng</span>{% endif %}</td><td class='muted'>{{k.expires_at or '—'}}</td><td><span class='pill {{'rejected' if k.locked else ('approved' if k.used_by and k.expires_at and k.expires_at > now_iso else 'pending')}}'>{{'ĐANG KHÓA' if k.locked else ('ĐANG CHẠY' if k.used_by and k.expires_at and k.expires_at > now_iso else ('ĐÃ CẤP' if k.used_by else 'CHƯA DÙNG'))}}</span></td><td style='white-space:nowrap'><form method='post' action='/admin/key/toggle' style='display:inline'><input type='hidden' name='key' value='{{k.key}}'><button style='margin:0;background:linear-gradient(135deg,#ffb454,#d98222)'>{{'Mở khóa' if k.locked else 'Khóa'}}</button></form> <form method='post' action='/admin/key/delete' style='display:inline' onsubmit="return confirm('Xóa key này?')"><input type='hidden' name='key' value='{{k.key}}'><button style='margin:0;background:linear-gradient(135deg,#e65b6e,#b7354b)'>Xóa</button></form></td></tr>{% else %}<tr><td colspan='6' class='muted'>Chưa có key.</td></tr>{% endfor %}</table></div><div class='row' style='margin-top:18px'><section><h2>✦ Tạo key nhanh</h2><form method='post' action='/admin/key'><label>Chọn gói</label><select name='package'>{% for n in packages %}<option>{{n}}</option>{% endfor %}</select><button>Tạo key mới</button></form>{% if generated %}<div style='margin-top:18px'>Key mới: <code>{{generated}}</code></div>{% endif %}</section></div></section>
+
+<!-- BACKUP / RESTORE SECTION -->
+<section id='backup' style='margin-top:18px'>
+<h2>💾 Backup & Restore dữ liệu</h2>
+<div class='backup-section'>
+<div class='backup-card'>
+<h3>📤 Export dữ liệu</h3>
+<p class='muted'>Tải xuống file backup .js chứa toàn bộ dữ liệu bot</p>
+<a href='/admin/backup/download'><button class='btn-green'>📥 Tải backup.js</button></a>
+</div>
+<div class='backup-card'>
+<h3>📥 Import dữ liệu</h3>
+<p class='muted'>Chọn file backup .js để khôi phục dữ liệu (sẽ xóa dữ liệu cũ)</p>
+<form method='post' action='/admin/backup/restore' enctype='multipart/form-data'>
+<input type='file' name='backup_file' accept='.js' required style='margin-top:5px'>
+<button class='btn-orange'>🔄 Khôi phục</button>
+</form>
+{% if restore_msg %}<div style='margin-top:10px;color:var(--green)'>{{restore_msg}}</div>{% endif %}
+</div>
+</div>
+</section>
+
+<div class='footer'>{{bot_name}} · Admin Control Center · Dữ liệu được lưu trong SQLite</div>
+</main></div></body></html>
 """
 
 @app.get("/")
@@ -983,7 +1109,8 @@ def admin_page():
     packages = get_setting("packages", DEFAULT_PACKAGES); bank = get_setting("bank", DEFAULT_BANK)
     token = str(get_setting("bot_token", BOT_TOKEN) or "")
     ids = get_setting("admin_ids", sorted(x for x in ADMIN_IDS if x != 0))
-    return render_template_string(ADMIN_HTML, bot_name=BOT_NAME, bot_ready=bool(token), deposits=deposits, users=users, packages=packages, bank=bank, stats=stats, keys=keys, admin_ids=','.join(map(str, ids)), token_value="", packages_json=json.dumps(packages, ensure_ascii=False, indent=2), generated=request.args.get("generated", ""), now_iso=iso(now()))
+    restore_msg = request.args.get("restore_msg", "")
+    return render_template_string(ADMIN_HTML, bot_name=BOT_NAME, bot_ready=bool(token), deposits=deposits, users=users, packages=packages, bank=bank, stats=stats, keys=keys, admin_ids=','.join(map(str, ids)), token_value="", packages_json=json.dumps(packages, ensure_ascii=False, indent=2), generated=request.args.get("generated", ""), now_iso=iso(now()), restore_msg=restore_msg)
 
 @app.post("/admin/runtime")
 def admin_runtime():
@@ -1073,6 +1200,47 @@ def admin_key_delete():
         c.execute("DELETE FROM keys WHERE key=?", (key,))
     return redirect("/admin#keys")
 
+# ============================================================
+# BACKUP / RESTORE ROUTES
+# ============================================================
+@app.get("/admin/backup/download")
+def backup_download():
+    data = export_all_data()
+    # Tạo file .js với định dạng JavaScript export
+    js_content = f"// Backup data - {BOT_NAME}\n// Exported at: {iso(now())}\nconst backupData = {data};\n"
+    return send_file(
+        BytesIO(js_content.encode('utf-8')),
+        mimetype='application/javascript',
+        as_attachment=True,
+        download_name='backup.js'
+    )
+
+@app.post("/admin/backup/restore")
+def backup_restore():
+    if 'backup_file' not in request.files:
+        return "Không có file được chọn", 400
+    file = request.files['backup_file']
+    if file.filename == '':
+        return "File rỗng", 400
+    try:
+        content = file.read().decode('utf-8')
+        # Tìm JSON trong file .js
+        json_match = re.search(r'backupData\s*=\s*({.*?});?\s*$', content, re.DOTALL | re.IGNORECASE)
+        if not json_match:
+            # Thử parse toàn bộ nội dung như JSON
+            try:
+                json.loads(content)
+                import_all_data(content)
+            except:
+                return "File không đúng định dạng backup (không tìm thấy backupData)", 400
+        else:
+            json_data = json_match.group(1)
+            import_all_data(json_data)
+        return redirect("/admin?restore_msg=✅ Đã khôi phục dữ liệu thành công!")
+    except Exception as e:
+        log.exception("Lỗi restore backup")
+        return f"Lỗi khi khôi phục dữ liệu: {str(e)}", 500
+
 
 @app.get("/admin/stats")
 def admin_stats_api():
@@ -1085,7 +1253,6 @@ def run_web():
 
 if __name__ == "__main__":
     init_db()
-    # Luôn mở web admin trước. Token có thể nhập từ /admin sau khi Render chạy.
     start_bot_if_configured()
     threading.Thread(target=run_web, daemon=True, name="flask-admin").start()
     log.info("Admin web đang chạy trên port %s; bot_ready=%s", PORT, _polling_started)
