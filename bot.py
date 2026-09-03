@@ -15,6 +15,7 @@ import requests
 import telebot
 from telebot import types
 from flask import Flask, request, redirect, render_template_string, jsonify
+from predictor import HashAnalyzer, predict_sessions
 
 # ============================================================
 # CẤU HÌNH QUA BIẾN MÔI TRƯỜNG
@@ -24,6 +25,8 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "8030294480").split(
 PORT = int(os.getenv("PORT", "10000"))
 DB_PATH = os.getenv("DB_PATH", "bot.sqlite3")
 BOT_NAME = os.getenv("BOT_NAME", "MD5 Tài Xỉu Pro")
+GAME_CONFIG_PATH = os.getenv("GAME_CONFIG_PATH", os.path.join(os.path.dirname(__file__), "games_api.json"))
+BUILTIN_GAME_APIS = [{'name': 'LC79 Tài Xỉu', 'slug': 'lc79-tx', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://lc79.bet', 'api_url': 'https://wtx.tele68.com/v1/tx/sessions', 'tables_api': '', 'image': 'https://files.catbox.moe/ng8pg8.jfif', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 0}, {'name': 'LC79 MD5', 'slug': 'lc79-md5', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://lc79.bet', 'api_url': 'https://wtxmd52.tele68.com/v1/txmd5/sessions', 'tables_api': '', 'image': 'https://files.catbox.moe/ng8pg8.jfif', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 1}, {'name': 'BetVip Hũ', 'slug': 'betvip-hu', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://play.betvip.hot/?utm_source=seo&utm_campaign=betvip.jp.net&utm_medium=betvip.jp.net&utm_term=betvip.jp.net', 'api_url': 'https://wtx.macminim6.online/v1/tx/sessions', 'tables_api': '', 'image': 'https://files.catbox.moe/2gu29f.jpg', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 2}, {'name': 'BetVip MD5', 'slug': 'betvip-md5', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://play.betvip.hot/?utm_source=seo&utm_campaign=betvip.jp.net&utm_medium=betvip.jp.net&utm_term=betvip.jp.net', 'api_url': 'https://wtxmd52.macminim6.online/v1/txmd5/sessions', 'tables_api': '', 'image': 'https://files.catbox.moe/2gu29f.jpg', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 3}, {'name': 'Sunwin Tài Xỉu', 'slug': 'sunwin-tx', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://web.sunwin.works/?affId=Sunwin', 'api_url': 'https://cancer-counted-board-dam.trycloudflare.com/api/taixiu/history', 'tables_api': '', 'image': 'https://files.catbox.moe/ny0ayd.jpg', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 4}, {'name': 'Sunwin Sicbo', 'slug': 'sunwin-sicbo', 'cat': 'sicbo', 'kind': 'view', 'game_url': 'https://web.sunwin.works/?affId=Sunwin', 'api_url': 'https://api.wsktnus8.net/v2/history/getLastResult?gameId=ktrng_3979&size=100&tableId=39791215743193&curPage=1', 'tables_api': '', 'image': 'https://files.catbox.moe/61ohn2.jpg', 'hot': 0, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 5}, {'name': 'Max789 Hũ', 'slug': 'max789-hu', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://play.max789.vin/', 'api_url': 'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau', 'tables_api': '', 'image': 'https://files.catbox.moe/lsz8db.jpg', 'hot': 1, 'vip': 1, 'is_new': 1, 'enabled': 1, 'maintenance': 0, 'sort': 6}, {'name': 'Max789 MD5', 'slug': 'max789-md5', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://play.max789.vin/', 'api_url': 'https://max789-nqfd.onrender.com/api/taixiumd5/max789', 'tables_api': '', 'image': 'https://files.catbox.moe/lsz8db.jpg', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 7}, {'name': '789Club Sicbo', 'slug': '789-sicbo', 'cat': 'sicbo', 'kind': 'view', 'game_url': '', 'api_url': 'https://api.xeuigogo.info/v2/history/getLastResult?gameId=ktrng_3986&size=100&tableId=39861215743193&curPage=1', 'tables_api': '', 'image': 'https://files.catbox.moe/jx3lid.jpg', 'hot': 0, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 8}, {'name': 'Hitclub Tài Xỉu', 'slug': 'hit-tx', 'cat': 'taixiu', 'kind': 'panel', 'game_url': '', 'api_url': 'https://commission-comply-opened-ethnic.trycloudflare.com/api/tx', 'tables_api': '', 'image': 'https://files.catbox.moe/w2lk5r.jpg', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 1, 'sort': 9}, {'name': 'Hitclub MD5', 'slug': 'hit-md5', 'cat': 'taixiu', 'kind': 'panel', 'game_url': '', 'api_url': 'https://apihitclubmd5-x6r3.onrender.com/', 'tables_api': '', 'image': 'https://files.catbox.moe/w2lk5r.jpg', 'hot': 1, 'vip': 1, 'is_new': 1, 'enabled': 1, 'maintenance': 0, 'sort': 10}, {'name': 'Hitclub Sicbo', 'slug': 'hit-sicbo', 'cat': 'sicbo', 'kind': 'panel', 'game_url': '', 'api_url': 'https://api.wsmt8g.cc/v2/history/getLastResult?gameId=ktrng_3932&size=120&tableId=39321215743193&curPage=1', 'tables_api': '', 'image': 'https://files.catbox.moe/w2lk5r.jpg', 'hot': 0, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 11}, {'name': 'B52 Tài Xỉu', 'slug': 'b52-tx', 'cat': 'taixiu', 'kind': 'panel', 'game_url': '', 'api_url': 'https://b52-qiw2.onrender.com/api/history', 'tables_api': '', 'image': 'https://files.catbox.moe/yfwwxu.jpg', 'hot': 1, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 12}, {'name': 'B52 Sicbo', 'slug': 'b52-sicbo', 'cat': 'sicbo', 'kind': 'panel', 'game_url': '', 'api_url': 'https://api.wsmt8g.cc/v2/history/getLastResult?gameId=ktrng_3996&size=100&tableId=39961215743193&curPage=1', 'tables_api': '', 'image': 'https://files.catbox.moe/yfwwxu.jpg', 'hot': 0, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 14}, {'name': 'Baccarat AI', 'slug': 'baccarat', 'cat': 'baccarat', 'kind': 'baccarat', 'game_url': 'https://fly88m.cc/', 'api_url': 'https://apisieunhanh.lovable.app/api/public/bYoIEro5CgRHbfQ0qBgcYJYy1rfUTRafwqcZh0ta/apibaccarat', 'tables_api': 'https://apisieunhanh.lovable.app/api/public/bYoIEro5CgRHbfQ0qBgcYJYy1rfUTRafwqcZh0ta/apibaccarat', 'image': 'https://files.catbox.moe/5ughb8.png', 'hot': 1, 'vip': 1, 'is_new': 1, 'enabled': 1, 'maintenance': 0, 'sort': 15}, {'name': 'Xocdiax88 Hũ', 'slug': 'Xocdiax88Hu', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://play.xocdia88.news/', 'api_url': 'https://taixiu.system32-cloudfare-356783752985678522.monster/api/luckydice/GetSoiCau', 'tables_api': '', 'image': 'https://files.catbox.moe/7eg34c.jpeg', 'hot': 0, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 99}, {'name': 'Xocdiax88 Md5', 'slug': 'Xocdiax88Md5', 'cat': 'taixiu', 'kind': 'view', 'game_url': 'https://play.xocdia88.news/', 'api_url': 'https://taixiumd5.system32-cloudfare-356783752985678522.monster/api/md5luckydice/GetSoiCau', 'tables_api': '', 'image': 'https://files.catbox.moe/7eg34c.jpeg', 'hot': 0, 'vip': 1, 'is_new': 0, 'enabled': 1, 'maintenance': 0, 'sort': 99}]
 
 # Không đặt thông tin ngân hàng thật trong mã nguồn. Có thể sửa tại /admin.
 DEFAULT_BANK = {
@@ -118,6 +121,8 @@ def init_db():
         ]
         for slug, name, category, emoji, mode, api_url in default_games:
             c.execute("INSERT OR IGNORE INTO games(slug,name,category,emoji,mode,api_url,created_at) VALUES(?,?,?,?,?,?,?)", (slug,name,category,emoji,mode,api_url,iso(now())))
+        # JSON sẽ được đồng bộ sau khi init_db hoàn tất.
+
         gift_cols = [r[1] for r in c.execute("PRAGMA table_info(giftcodes)").fetchall()]
         if "active" not in gift_cols:
             c.execute("ALTER TABLE giftcodes ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
@@ -278,253 +283,35 @@ def user_key(uid):
 # Trích ý tưởng từ file mẫu: nibble, entropy, bit-run, Markov 2 bước,
 # phổ tần số và cellular rule 30. Không random, không math.random.
 # Lưu ý: hash ngẫu nhiên không chứa thông tin bảo đảm kết quả trò chơi.
-# ============================================================
-class HashAnalyzer:
-    @staticmethod
-    def _bits(data):
-        return [(b >> (7 - i)) & 1 for b in data for i in range(8)]
-
-    @staticmethod
-    def _entropy(values):
-        if not values:
-            return 0.0
-        cnt = Counter(values)
-        n = len(values)
-        return -sum((v / n) * __import__('math').log2(v / n) for v in cnt.values())
-
-    @staticmethod
-    def _spectral_score(bits):
-        # DFT thủ công, tránh thêm dependency và giữ tính tái lập.
-        import math
-        n = len(bits)
-        if n < 16:
-            return 0.0
-        score = 0.0
-        for k in range(1, min(n // 2, 32)):
-            re_part = sum(bits[t] * math.cos(2 * math.pi * k * t / n) for t in range(n))
-            im_part = sum(bits[t] * math.sin(2 * math.pi * k * t / n) for t in range(n))
-            power = re_part * re_part + im_part * im_part
-            score += power * (1 if k % 2 else -1)
-        return score / (n * n)
-
-    def _source_spectral_density(self, data):
-        """Phần spectral density được trích từ md5bot.py, chỉ nhận bytes MD5."""
-        if len(data) < 16:
-            return 0.0, 0.0
-        n = len(data)
-        harmonics = []
-        import math
-        for k in range(n // 2):
-            real = sum(data[t] * math.cos(2 * math.pi * k * t / n) for t in range(n))
-            imag = sum(data[t] * math.sin(2 * math.pi * k * t / n) for t in range(n))
-            harmonics.append(real * real + imag * imag)
-        if not harmonics:
-            return 0.0, 0.0
-        total = sum(harmonics) + 1e-9
-        odd_power = sum(harmonics[i] for i in range(1, len(harmonics), 2))
-        even_power = sum(harmonics[i] for i in range(0, len(harmonics), 2))
-        tai = xiu = 0.0
-        spectral_bias = (odd_power - even_power) / total
-        if spectral_bias > 0.15:
-            tai += 16.0
-        elif spectral_bias < -0.15:
-            xiu += 16.0
-        centroid = sum(i * power for i, power in enumerate(harmonics)) / total
-        if centroid > len(harmonics) / 2:
-            tai += 10.0
-        else:
-            xiu += 10.0
-        return tai, xiu
-
-    def _source_cellular_rule30(self, data):
-        """Rule 30 trong md5bot.py, giữ độc lập với các phần kết nối bên ngoài."""
-        if len(data) < 16:
-            return 0.0, 0.0
-        bits = self._bits(data)
-        state = list(bits)
-        density_history = []
-        for _ in range(8):
-            state = [state[(i - 1) % len(state)] ^ (state[i] | state[(i + 1) % len(state)]) for i in range(len(state))]
-            density_history.append(sum(state) / len(state))
-        tai = xiu = 0.0
-        avg_density = sum(density_history) / len(density_history)
-        if avg_density > 0.52:
-            tai += 18.0
-        elif avg_density < 0.48:
-            xiu += 18.0
-        if density_history[-1] > density_history[0]:
-            tai += 8.0
-        else:
-            xiu += 8.0
-        return tai, xiu
-
-    def _source_ultimate_md5_core(self, data):
-        """Lõi ultimate_md5_core_v4 đã tách riêng khỏi các tính năng VIP khác."""
-        if len(data) < 16:
-            return 0.0, 0.0, []
-        import math
-        n = len(data)
-        tai = xiu = 0.0
-        details = []
-        nibbles = [(b >> 4) & 0xF for b in data] + [b & 0xF for b in data]
-        high_nib = sum(1 for nib in nibbles if nib >= 8)
-        low_nib = len(nibbles) - high_nib
-        if high_nib > low_nib * 1.15:
-            tai += 15.0; details.append('v4-high-nibble→Tài')
-        elif low_nib > high_nib * 1.15:
-            xiu += 15.0; details.append('v4-low-nibble→Xỉu')
-        even_nib = sum(1 for nib in nibbles if nib % 2 == 0)
-        odd_nib = len(nibbles) - even_nib
-        if even_nib > odd_nib * 1.2:
-            xiu += 8.0
-        elif odd_nib > even_nib * 1.2:
-            tai += 8.0
-
-        byte_counts = Counter(data)
-        entropy = 0.0
-        for count in byte_counts.values():
-            p = count / n
-            if p > 0:
-                entropy -= p * math.log2(p)
-        max_entropy = math.log2(min(256, n))
-        entropy_ratio = entropy / max_entropy if max_entropy else 0.0
-        if entropy_ratio > 0.96:
-            if data[-1] >= 128: tai += 18.0
-            else: xiu += 18.0
-        elif entropy_ratio < 0.85:
-            if sum(data) / n > 128: xiu += 18.0
-            else: tai += 18.0
-
-        bits = self._bits(data)
-        ones = sum(bits); zeros = len(bits) - ones
-        if ones > zeros + 10: xiu += 12.0
-        elif zeros > ones + 10: tai += 12.0
-        runs = []; run = 1
-        for i in range(1, len(bits)):
-            if bits[i] == bits[i - 1]: run += 1
-            else: runs.append(run); run = 1
-        runs.append(run)
-        avg_run = sum(runs) / len(runs)
-        if avg_run > 2.5: tai += 10.0
-        elif avg_run < 1.8: xiu += 10.0
-
-        transitions = Counter()
-        for i in range(len(nibbles) - 2):
-            pair = (nibbles[i] >= 8, nibbles[i + 1] >= 8)
-            transitions[(pair, nibbles[i + 2] >= 8)] += 1
-        last_pair = (nibbles[-2] >= 8, nibbles[-1] >= 8)
-        if transitions[(last_pair, True)] > transitions[(last_pair, False)]:
-            tai += 20.0
-        elif transitions[(last_pair, False)] > transitions[(last_pair, True)]:
-            xiu += 20.0
-
-        spectral_tai, spectral_xiu = self._source_spectral_density(data)
-        cellular_tai, cellular_xiu = self._source_cellular_rule30(data)
-        tai += spectral_tai + cellular_tai
-        xiu += spectral_xiu + cellular_xiu
-        if tai > xiu + 5:
-            details.append('v4-core→Tài')
-        elif xiu > tai + 5:
-            details.append('v4-core→Xỉu')
-        return tai, xiu, details
-
-    def analyze(self, value):
-        raw = re.sub(r"\s+", "", value or "").lower()
-        if not re.fullmatch(r"[0-9a-f]{32}|[0-9a-f]{64}", raw):
-            return {"ok": False, "error": "Mã phải là MD5 32 ký tự hoặc SHA-256 64 ký tự hệ hex."}
-        data = bytes.fromhex(raw)
-        bits = self._bits(data)
-        score_tai = 50.0
-        score_xiu = 50.0
-        details = []
-
-        # Bổ sung lõi dự đoán v4 từ md5bot.py; không thay đổi các luồng
-        # key, nạp tiền, tài khoản hoặc quản trị của bot hiện tại.
-        v4_tai, v4_xiu, v4_details = self._source_ultimate_md5_core(data)
-        score_tai += v4_tai
-        score_xiu += v4_xiu
-        details.extend(v4_details)
-
-        # 1. Nibble/high-low score, lấy trực tiếp tinh thần ultimate_md5_core_v4.
-        nibbles = [(b >> 4) & 15 for b in data] + [b & 15 for b in data]
-        high = sum(1 for n in nibbles if n >= 8)
-        low = len(nibbles) - high
-        if high > low * 1.15:
-            score_tai += 8; details.append("high-nibble→Tài")
-        elif low > high * 1.15:
-            score_xiu += 8; details.append("low-nibble→Xỉu")
-
-        odd = sum(n % 2 for n in nibbles)
-        even = len(nibbles) - odd
-        if odd > even * 1.20:
-            score_tai += 5
-        elif even > odd * 1.20:
-            score_xiu += 5
-
-        # 2. Shannon entropy và phân bố byte.
-        ent = self._entropy(data)
-        ratio = ent / 8.0
-        if ratio > 0.90:
-            (score_tai if data[-1] >= 128 else score_xiu)
-            if data[-1] >= 128: score_tai += 6
-            else: score_xiu += 6
-            details.append("entropy-cao")
-        elif ratio < 0.70:
-            if sum(data) / len(data) >= 128: score_xiu += 6
-            else: score_tai += 6
-            details.append("entropy-thap")
-
-        # 3. Bit ratio và độ dài run.
-        ones = sum(bits); zeros = len(bits) - ones
-        if zeros > ones + 10: score_tai += 6
-        elif ones > zeros + 10: score_xiu += 6
-        runs = []
-        run = 1
-        for i in range(1, len(bits)):
-            if bits[i] == bits[i - 1]: run += 1
-            else: runs.append(run); run = 1
-        runs.append(run)
-        avg_run = sum(runs) / max(1, len(runs))
-        if avg_run > 2.5: score_tai += 5
-        elif avg_run < 1.8: score_xiu += 5
-
-        # 4. Markov 2-step trên chuỗi nibble cao/thấp trong chính hash.
-        trans = Counter()
-        highbits = [int(n >= 8) for n in nibbles]
-        for i in range(len(highbits) - 2):
-            trans[(highbits[i], highbits[i + 1], highbits[i + 2])] += 1
-        last = tuple(highbits[-2:])
-        t = trans[(last[0], last[1], 1)]
-        x = trans[(last[0], last[1], 0)]
-        if t > x: score_tai += 7
-        elif x > t: score_xiu += 7
-
-        # 5. Fourier-like deterministic spectral score.
-        spectral = self._spectral_score(bits)
-        if spectral > 0.002: score_tai += 5; details.append("spectral→Tài")
-        elif spectral < -0.002: score_xiu += 5; details.append("spectral→Xỉu")
-
-        # 6. Cellular automaton Rule 30, cùng ý tưởng trong file mẫu.
-        state = bits[:]
-        for _ in range(8):
-            state = [state[(i - 1) % len(state)] ^ (state[i] | state[(i + 1) % len(state)]) for i in range(len(state))]
-        density = sum(state) / len(state)
-        if density > 0.52: score_tai += 5
-        elif density < 0.48: score_xiu += 5
-
-        total = score_tai + score_xiu
-        tai = round(score_tai / total * 100, 1)
-        xiu = round(score_xiu / total * 100, 1)
-        result = "Tài" if tai >= xiu else "Xỉu"
-        confidence = round(max(tai, xiu), 1)
-        return {"ok": True, "hash": raw, "result": result, "tai": tai, "xiu": xiu,
-                "confidence": confidence, "detail": ", ".join(details) or "tổng hợp deterministic"}
+# ========analyzer = HashAnalyzer() "tổng hợp deterministic"}
 
 analyzer = HashAnalyzer()
 
 # ============================================================
 # GAME CATALOG + API PHIÊN / DỰ ĐOÁN NỘI BỘ
 # ============================================================
+def sync_games_from_json():
+    """Nạp API embedded từ JSON export; file ngoài chỉ là tuỳ chọn override."""
+    ports=list(BUILTIN_GAME_APIS)
+    try:
+        with open(GAME_CONFIG_PATH, encoding='utf-8') as f:
+            external=json.load(f)
+        if isinstance(external,dict) and external.get('ports'): ports=external['ports']
+    except (OSError,ValueError,TypeError):
+        pass
+    emojis={'taixiu':'🎲','sicbo':'🎯','baccarat':'🃏'}; changed=0
+    with db() as c:
+        for p in ports:
+            if not isinstance(p,dict): continue
+            slug=str(p.get('slug','')).strip().lower()
+            if not slug: continue
+            cat={'taixiu':'tx','sicbo':'sicbo','baccarat':'baccarat'}.get(str(p.get('cat','taixiu')).lower(),'tx')
+            name=str(p.get('name') or slug).strip(); api=str(p.get('api_url') or '').strip()
+            mode='md5' if 'md5' in slug or 'md5' in name.lower() else 'api'
+            emoji=emojis.get(cat,'🎮')
+            c.execute("INSERT INTO games(slug,name,category,emoji,api_url,mode,enabled,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET name=excluded.name,category=excluded.category,api_url=excluded.api_url,mode=excluded.mode,enabled=excluded.enabled",(slug,name,cat,emoji,api,mode,1 if int(p.get('enabled',1)) else 0,iso(now())))
+            changed+=1
+    return changed
 def game_rows(category=None):
     with db() as c:
         if category:
@@ -571,72 +358,6 @@ def api_sessions(url):
         if row['sid'] not in unique or unique[row['sid']]['total'] == 0: unique[row['sid']] = row
     out = sorted(unique.values(), key=lambda x: x['sid'], reverse=True)
     return out[:120], ''
-
-def predict_sessions(sessions):
-    """Ensemble deterministic cho chuỗi phiên mới -> cũ.
-    Đây là phân tích tham khảo, không thể biến trò chơi ngẫu nhiên thành kết quả chắc chắn.
-    """
-    if not sessions: return {'ok':False,'error':'Chưa có dữ liệu phiên'}
-    rows=[x for x in sessions if x.get('res') in ('T','X')]
-    if not rows: return {'ok':False,'error':'Dữ liệu phiên không có kết quả T/X'}
-    seq=[x['res'] for x in rows[:120]]; n=len(seq); last=seq[0]; flip=lambda x:'X' if x=='T' else 'T'
-    scores={'T':0.0,'X':0.0}; votes=[]; details=[]
-    def vote(name,pick,weight):
-        if pick in scores and weight>0: scores[pick]+=weight; votes.append((name,pick,weight))
-    # 1) Tần suất đa cửa sổ: ưu tiên cửa sổ ngắn nhưng không bỏ qua nền dài.
-    for size,weight in ((6,1.2),(12,1.5),(30,1.0),(60,.55)):
-        part=seq[:min(size,n)]; c=Counter(part)
-        if c['T']!=c['X']:
-            vote(f'freq-{size}', 'T' if c['T']>c['X'] else 'X', weight*(1+abs(c['T']-c['X'])/max(1,len(part))))
-    # 2) Markov bậc 1 và 2 trên lịch sử đảo chiều về thứ tự cũ -> mới.
-    forward=list(reversed(seq))
-    for order,weight in ((1,1.35),(2,1.7)):
-        if len(forward)<=order+3: continue
-        key=tuple(forward[-order:]); counts={'T':0,'X':0}
-        for i in range(len(forward)-order):
-            if tuple(forward[i:i+order])==key: counts[forward[i+order]]+=1
-        if counts['T']+counts['X']>=2 and counts['T']!=counts['X']:
-            vote(f'markov-{order}', 'T' if counts['T']>counts['X'] else 'X', weight*(max(counts.values())+1)/(sum(counts.values())+2))
-    # 3) Nhận diện cầu bệt: học tiếp tục/gãy bằng các bệt tương tự trong lịch sử.
-    streak=1
-    while streak<n and seq[streak]==last: streak+=1
-    cont=brk=0; i=0
-    while i<n:
-        j=i+1
-        while j<n and seq[j]==seq[i]: j+=1
-        run=j-i
-        if run==streak:
-            if j<n: brk+=1
-            else: cont+=1
-        elif run==streak-1 and j<n: cont+=1
-        i=j
-    if streak>=4: vote('streak-break' if streak>=5 else 'streak-follow', flip(last) if streak>=5 else last, 1.8 if streak>=5 else 1.1)
-    if cont+brk>=2 and cont!=brk: vote('learned-streak', last if cont>brk else flip(last), 1.45)
-    # 4) Cầu 1-1 / xen kẽ trong 8 phiên gần nhất.
-    if n>=4:
-        alt=sum(seq[i]!=seq[i+1] for i in range(min(7,n-1)))/max(1,min(7,n-1))
-        if alt>=.72: vote('alternation', flip(last), 1.55); details.append('cầu xen kẽ')
-        elif alt<=.28: vote('same-direction', last, 1.2); details.append('cầu bệt')
-    # 5) Trọng số recency: các phiên mới có ảnh hưởng cao hơn, tránh chỉ nhìn majority.
-    rec={'T':0.0,'X':0.0}
-    for idx,val in enumerate(seq[:20]): rec[val]+=1/(idx+1)**0.55
-    vote('recency','T' if rec['T']>rec['X'] else 'X',1.35*abs(rec['T']-rec['X'])/max(rec['T'],rec['X'],1))
-    # 6) Nếu có tổng/dice, dùng như tín hiệu phụ; không để ghi đè ensemble.
-    totals=[int(x.get('total') or 0) for x in rows[:12] if int(x.get('total') or 0)>0]
-    if totals:
-        avg=sum(totals)/len(totals); vote('total-bias','T' if avg>=11 else 'X',.45)
-    if scores['T']==scores['X']: pick=last
-    else: pick='T' if scores['T']>scores['X'] else 'X'
-    total_score=scores['T']+scores['X']; gap=abs(scores['T']-scores['X'])/max(total_score,1)
-    agreement=sum(w for _,p,w in votes if p==pick)/max(sum(w for _,_,w in votes),1)
-    # Cap 92% để không tạo ảo giác chắc thắng.
-    confidence=int(round(max(52,min(92,50+gap*48+max(0,agreement-.5)*12))))
-    top=', '.join(name for name,p,w in sorted(votes,key=lambda z:z[2],reverse=True) if p==pick)[:180]
-    details.append(f'{len(votes)} tín hiệu đồng thuận')
-    return {'ok':True,'sid':rows[0].get('sid',0),'next':rows[0].get('sid',0)+1 if rows[0].get('sid',0) else 0,
-            'pick':pick,'label':'Tài' if pick=='T' else 'Xỉu','conf':confidence,
-            'last':rows[0].get('res'),'total':rows[0].get('total',0),'history':seq[:30],
-            'reason':'ensemble: '+(top or 'cân bằng')+' · '+', '.join(details)}
 
 def game_keyboard(category):
     k = types.InlineKeyboardMarkup(row_width=2)
@@ -1315,6 +1036,7 @@ def run_web():
 
 if __name__ == "__main__":
     init_db()
+    sync_games_from_json()
     # Luôn mở web admin trước. Token có thể nhập từ /admin sau khi Render chạy.
     start_bot_if_configured()
     threading.Thread(target=run_web, daemon=True, name="flask-admin").start()
