@@ -570,15 +570,70 @@ def api_sessions(url):
     return out[:120], ''
 
 def predict_sessions(sessions):
+    """Ensemble deterministic cho chuỗi phiên mới -> cũ.
+    Đây là phân tích tham khảo, không thể biến trò chơi ngẫu nhiên thành kết quả chắc chắn.
+    """
     if not sessions: return {'ok':False,'error':'Chưa có dữ liệu phiên'}
-    seq = [x['res'] for x in sessions]
-    counts = Counter(seq[:30]); last = seq[0]
-    streak = 1
-    while streak < len(seq) and seq[streak] == last: streak += 1
-    if streak >= 5: pick = 'X' if last == 'T' else 'T'
-    else: pick = 'T' if counts['T'] >= counts['X'] else 'X'
-    confidence = min(88, max(52, round(50 + abs(counts['T']-counts['X']) / max(1,len(seq[:30])) * 42)))
-    return {'ok':True,'sid':sessions[0]['sid'],'next':sessions[0]['sid']+1 if sessions[0]['sid'] else 0,'pick':pick,'label':'Tài' if pick=='T' else 'Xỉu','conf':confidence,'last':sessions[0]['res'],'total':sessions[0]['total'],'history':seq[:30],'reason':'phân tích chuỗi phiên deterministic; không đảm bảo kết quả'}
+    rows=[x for x in sessions if x.get('res') in ('T','X')]
+    if not rows: return {'ok':False,'error':'Dữ liệu phiên không có kết quả T/X'}
+    seq=[x['res'] for x in rows[:120]]; n=len(seq); last=seq[0]; flip=lambda x:'X' if x=='T' else 'T'
+    scores={'T':0.0,'X':0.0}; votes=[]; details=[]
+    def vote(name,pick,weight):
+        if pick in scores and weight>0: scores[pick]+=weight; votes.append((name,pick,weight))
+    # 1) Tần suất đa cửa sổ: ưu tiên cửa sổ ngắn nhưng không bỏ qua nền dài.
+    for size,weight in ((6,1.2),(12,1.5),(30,1.0),(60,.55)):
+        part=seq[:min(size,n)]; c=Counter(part)
+        if c['T']!=c['X']:
+            vote(f'freq-{size}', 'T' if c['T']>c['X'] else 'X', weight*(1+abs(c['T']-c['X'])/max(1,len(part))))
+    # 2) Markov bậc 1 và 2 trên lịch sử đảo chiều về thứ tự cũ -> mới.
+    forward=list(reversed(seq))
+    for order,weight in ((1,1.35),(2,1.7)):
+        if len(forward)<=order+3: continue
+        key=tuple(forward[-order:]); counts={'T':0,'X':0}
+        for i in range(len(forward)-order):
+            if tuple(forward[i:i+order])==key: counts[forward[i+order]]+=1
+        if counts['T']+counts['X']>=2 and counts['T']!=counts['X']:
+            vote(f'markov-{order}', 'T' if counts['T']>counts['X'] else 'X', weight*(max(counts.values())+1)/(sum(counts.values())+2))
+    # 3) Nhận diện cầu bệt: học tiếp tục/gãy bằng các bệt tương tự trong lịch sử.
+    streak=1
+    while streak<n and seq[streak]==last: streak+=1
+    cont=brk=0; i=0
+    while i<n:
+        j=i+1
+        while j<n and seq[j]==seq[i]: j+=1
+        run=j-i
+        if run==streak:
+            if j<n: brk+=1
+            else: cont+=1
+        elif run==streak-1 and j<n: cont+=1
+        i=j
+    if streak>=4: vote('streak-break' if streak>=5 else 'streak-follow', flip(last) if streak>=5 else last, 1.8 if streak>=5 else 1.1)
+    if cont+brk>=2 and cont!=brk: vote('learned-streak', last if cont>brk else flip(last), 1.45)
+    # 4) Cầu 1-1 / xen kẽ trong 8 phiên gần nhất.
+    if n>=4:
+        alt=sum(seq[i]!=seq[i+1] for i in range(min(7,n-1)))/max(1,min(7,n-1))
+        if alt>=.72: vote('alternation', flip(last), 1.55); details.append('cầu xen kẽ')
+        elif alt<=.28: vote('same-direction', last, 1.2); details.append('cầu bệt')
+    # 5) Trọng số recency: các phiên mới có ảnh hưởng cao hơn, tránh chỉ nhìn majority.
+    rec={'T':0.0,'X':0.0}
+    for idx,val in enumerate(seq[:20]): rec[val]+=1/(idx+1)**0.55
+    vote('recency','T' if rec['T']>rec['X'] else 'X',1.35*abs(rec['T']-rec['X'])/max(rec['T'],rec['X'],1))
+    # 6) Nếu có tổng/dice, dùng như tín hiệu phụ; không để ghi đè ensemble.
+    totals=[int(x.get('total') or 0) for x in rows[:12] if int(x.get('total') or 0)>0]
+    if totals:
+        avg=sum(totals)/len(totals); vote('total-bias','T' if avg>=11 else 'X',.45)
+    if scores['T']==scores['X']: pick=last
+    else: pick='T' if scores['T']>scores['X'] else 'X'
+    total_score=scores['T']+scores['X']; gap=abs(scores['T']-scores['X'])/max(total_score,1)
+    agreement=sum(w for _,p,w in votes if p==pick)/max(sum(w for _,_,w in votes),1)
+    # Cap 92% để không tạo ảo giác chắc thắng.
+    confidence=int(round(max(52,min(92,50+gap*48+max(0,agreement-.5)*12))))
+    top=', '.join(name for name,p,w in sorted(votes,key=lambda z:z[2],reverse=True) if p==pick)[:180]
+    details.append(f'{len(votes)} tín hiệu đồng thuận')
+    return {'ok':True,'sid':rows[0].get('sid',0),'next':rows[0].get('sid',0)+1 if rows[0].get('sid',0) else 0,
+            'pick':pick,'label':'Tài' if pick=='T' else 'Xỉu','conf':confidence,
+            'last':rows[0].get('res'),'total':rows[0].get('total',0),'history':seq[:30],
+            'reason':'ensemble: '+(top or 'cân bằng')+' · '+', '.join(details)}
 
 def game_keyboard(category):
     k = types.InlineKeyboardMarkup(row_width=2)
@@ -660,7 +715,7 @@ def callbacks(call):
         elif call.data.startswith("approve_confirm:"): decide_deposit(uid, int(call.data.split(":")[1]), True)
         elif call.data.startswith("reject:"): request_reject(uid, int(call.data.split(":")[1]), call)
         elif call.data.startswith("reject_confirm:"): decide_deposit(uid, int(call.data.split(":")[1]), False)
-        elif call.data == "admin_key": edit_page(call, "🔑 <b>Tạo key</b>\n\nDùng lệnh <code>/taokey Tên_gói</code> để tạo key.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
+        elif call.data == "admin_key": edit_page(call, "🔑 <b>Tạo key</b>\n\nDùng lệnh <code>/taokey số_ngày số_lượng</code>, ví dụ <code>/taokey 30 10</code>.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
         elif call.data == "admin_stats": send_stats(cid, call)
         elif call.data == "admin_broadcast":
             edit_page(call, "📢 <b>THÔNG BÁO TOÀN BỘ</b>\n\nHãy nhập nội dung thông báo ở tin nhắn kế tiếp.", types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ Admin", callback_data="admin_menu")))
