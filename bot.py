@@ -1,4 +1,5 @@
 import os
+import os
 import re
 import json
 import time
@@ -18,7 +19,7 @@ from flask import Flask, request, redirect, render_template_string, jsonify
 # ============================================================
 # CẤU HÌNH QUA BIẾN MÔI TRƯỜNG
 # ============================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8477166662:AAHpUmD1-p9iPWIyvhKy_5I9Hc7sQkjwbU0").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "8030294480").split(",") if x.strip().lstrip("-").isdigit()}
 PORT = int(os.getenv("PORT", "10000"))
 DB_PATH = os.getenv("DB_PATH", "bot.sqlite3")
@@ -164,75 +165,6 @@ def get_setting(key, default):
 def set_setting(key, value):
     with db() as c:
         c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value, ensure_ascii=False)))
-
-
-def restore_rows(table, rows):
-    """Khôi phục bản ghi theo schema thật, không bind cả object JS vào 2 cột.
-
-    Hàm này cố ý chỉ nhận mapping (dict) và chỉ ghi các cột tồn tại trong bảng.
-    Vì vậy dữ liệu từ JSON/JS có thêm trường, thiếu trường hoặc thứ tự trường
-    khác nhau sẽ không tạo ra lỗi SQLite kiểu ``38 values for 2 columns``.
-    """
-    allowed_tables = {"settings", "users", "keys", "deposits", "broadcasts", "giftcodes", "giftcode_uses"}
-    if table not in allowed_tables:
-        raise ValueError("Bảng khôi phục không được phép")
-    if not isinstance(rows, (list, tuple)):
-        raise ValueError("Dữ liệu khôi phục phải là một danh sách bản ghi")
-    inserted = 0
-    with db() as c:
-        columns = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            clean = {str(k): v for k, v in row.items() if str(k) in columns}
-            if not clean:
-                continue
-            names = list(clean)
-            placeholders = ",".join("?" for _ in names)
-            c.execute(f"INSERT OR REPLACE INTO {table} ({','.join(names)}) VALUES ({placeholders})", [clean[n] for n in names])
-            inserted += 1
-    return inserted
-
-
-def parse_restore_text(text):
-    """Đọc JSON hoặc JS chứa object/array JSON mà không thực thi JavaScript."""
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("File khôi phục rỗng")
-    source = re.sub(r"/\*.*?\*/|^[ \t]*//[^\n]*", "", text, flags=re.S | re.M)
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(source):
-        if char not in "[{":
-            continue
-        try:
-            value, _ = decoder.raw_decode(source[index:])
-            if isinstance(value, (dict, list)):
-                return value
-        except json.JSONDecodeError:
-            continue
-    raise ValueError("Không tìm thấy JSON hợp lệ trong file JS/JSON")
-
-
-def restore_payload(payload):
-    """Nhận {table: [rows]} hoặc [{table: ..., ...}], trả về thống kê."""
-    if isinstance(payload, dict):
-        batches = [(table, rows) for table, rows in payload.items() if table in {
-            "settings", "users", "keys", "deposits", "broadcasts", "giftcodes", "giftcode_uses"
-        }]
-    elif isinstance(payload, list):
-        grouped = {}
-        for item in payload:
-            if isinstance(item, dict) and item.get("table"):
-                row = {k: v for k, v in item.items() if k != "table"}
-                grouped.setdefault(str(item["table"]), []).append(row)
-        batches = list(grouped.items())
-    else:
-        raise ValueError("Định dạng khôi phục không được hỗ trợ")
-    stats = {}
-    for table, rows in batches:
-        stats[table] = restore_rows(table, rows)
-    if not stats:
-        raise ValueError("Không có bảng dữ liệu hợp lệ để khôi phục")
-    return stats
 
 
 def is_admin(uid):
@@ -506,6 +438,7 @@ class HashAnalyzer:
         ent = self._entropy(data)
         ratio = ent / 8.0
         if ratio > 0.90:
+            (score_tai if data[-1] >= 128 else score_xiu)
             if data[-1] >= 128: score_tai += 6
             else: score_xiu += 6
             details.append("entropy-cao")
@@ -556,11 +489,7 @@ class HashAnalyzer:
         tai = round(score_tai / total * 100, 1)
         xiu = round(score_xiu / total * 100, 1)
         result = "Tài" if tai >= xiu else "Xỉu"
-        # MD5 có tính chất avalanche: không thể suy ra kết quả ngẫu nhiên từ hash.
-        # Giới hạn confidence để bot không biến heuristic thành lời hứa thắng chắc.
-        margin = abs(tai - xiu)
-        confidence = round(min(65.0, 50.0 + margin * 0.45), 1)
-        details.append("heuristic-deterministic; không đảm bảo kết quả thực tế")
+        confidence = round(max(tai, xiu), 1)
         return {"ok": True, "hash": raw, "result": result, "tai": tai, "xiu": xiu,
                 "confidence": confidence, "detail": ", ".join(details) or "tổng hợp deterministic"}
 
@@ -1112,33 +1041,6 @@ def admin_packages():
         set_setting("packages", value)
     except Exception: return "JSON gói không hợp lệ", 400
     return redirect("/admin")
-
-
-@app.post("/admin/restore")
-def admin_restore():
-    """Khôi phục file .js/.json dạng JSON mà không thực thi mã lạ.
-
-    Form field: ``file``. Có thể gửi object {tên_bảng: [bản ghi]} hoặc
-    danh sách bản ghi có trường ``table``. Không dùng INSERT cố định 2 cột.
-    """
-    uploaded = request.files.get("file")
-    if not uploaded or not uploaded.filename:
-        return "Chưa chọn file JS/JSON", 400
-    try:
-        raw = uploaded.read()
-        if len(raw) > 10 * 1024 * 1024:
-            return "File quá lớn (tối đa 10 MB)", 413
-        payload = parse_restore_text(raw.decode("utf-8-sig"))
-        stats = restore_payload(payload)
-        return jsonify(ok=True, restored=stats)
-    except UnicodeDecodeError:
-        return "File phải dùng mã hóa UTF-8", 400
-    except (ValueError, json.JSONDecodeError) as exc:
-        log.warning("Khôi phục dữ liệu thất bại: %s", exc)
-        return f"Lỗi khi khôi phục dữ liệu: {html.escape(str(exc))}", 400
-    except sqlite3.Error:
-        log.exception("Khôi phục dữ liệu gặp lỗi SQLite")
-        return "Lỗi khi khôi phục dữ liệu: schema file không tương thích", 400
 
 @app.post("/admin/key")
 def admin_key():
